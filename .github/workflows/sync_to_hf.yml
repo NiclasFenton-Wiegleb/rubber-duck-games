@@ -1,0 +1,27 @@
+name: Sync to Hugging Face Space
+
+on:
+  push:
+    branches:
+      - main  # Triggers on push to main
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0  # Fetch full history for proper git sync
+          lfs: true       # Include Git LFS files if any
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          git config --global credential.helper store
+          echo "https://user:${HF_TOKEN}@huggingface.co" > ~/.git-credentials
+
+          git remote add space https://huggingface.co/spaces/niclasfw/rubber-duck-games
+
+          git push space main --force
