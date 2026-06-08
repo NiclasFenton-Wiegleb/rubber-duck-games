@@ -1,4 +1,15 @@
-title: Game Dev Rubber Duck emoji: 🦆 colorFrom: yellow colorTo: green sdk: gradio sdk_version: "5.0.0" python_version: "3.12" app_file: app.py pinned: false
+---
+
+title: {{Game Dev Rubber Duck}} 
+emoji: {{🦆}} 
+colorFrom: {{yellow}} 
+colorTo: {{green}} 
+sdk: {{gradio}} 
+sdk_version: {{ "5.0.0"}} 
+python_version: {{"3.12"}} 
+app_file: app.py 
+pinned: false
+---
 
 🦆 Game Dev Rubber Duck
 
