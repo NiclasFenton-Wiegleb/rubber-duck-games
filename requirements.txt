@@ -16,7 +16,10 @@ sentence-transformers>=2.7
 # Use faiss-gpu instead if running on a CUDA machine.
 faiss-cpu>=1.8
 numpy>=1.26
-huggingface_hub>=0.23
+# Cap below 1.0: huggingface_hub 1.0 removed `HfFolder`, which gradio 5.x's
+# oauth.py still imports (`from huggingface_hub import HfFolder, whoami`).
+# Without this cap the build pulls hub>=1.0 and `import gradio` crashes.
+huggingface_hub>=0.23,<1.0
 tqdm>=4.66
 
 # ── Local small language model ─────────────────────────────────
