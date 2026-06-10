@@ -1,0 +1,24 @@
+# ── Web framework ──────────────────────────────────────────────
+Flask>=3.0
+flask-cors>=4.0
+python-dotenv>=1.0
+
+# ── Knowledge Graph pipeline ───────────────────────────────────
+networkx>=3.2
+beautifulsoup4>=4.12
+lxml>=5.0
+spacy>=3.7
+sentence-transformers>=2.7
+# Use faiss-gpu instead if running on a CUDA machine.
+faiss-cpu>=1.8
+numpy>=1.26
+huggingface_hub>=0.23
+tqdm>=4.66
+
+# ── Local small language model ─────────────────────────────────
+torch>=2.2
+transformers>=4.44
+accelerate>=0.30
+
+# After install, download the spaCy English model:
+#   python -m spacy download en_core_web_sm

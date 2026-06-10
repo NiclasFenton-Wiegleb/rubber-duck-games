@@ -1,0 +1,15 @@
+# Secrets / env
+.env
+
+# Generated KG artifacts
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Model / HF caches
+.cache/
