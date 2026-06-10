@@ -23,5 +23,9 @@ torch>=2.2
 transformers>=4.44
 accelerate>=0.30
 
+# ── HuggingFace ZeroGPU (on-demand GPU) ────────────────────────
+# Provides the @spaces.GPU decorator used by the Space entry point (app.py).
+spaces>=0.30
+
 # After install, download the spaCy English model:
 #   python -m spacy download en_core_web_sm

@@ -31,5 +31,12 @@ accelerate>=0.30
 gradio>=5.0
 requests>=2.31
 
+# ── HuggingFace ZeroGPU (on-demand GPU) ────────────────────────
+# Provides the @spaces.GPU decorator. A ZeroGPU Space refuses to start unless
+# at least one @spaces.GPU function is detected, and a GPU is only attached for
+# the duration of such a call (no persistent CUDA device at startup).
+spaces>=0.30
+
+
 # After install, download the spaCy English model (only needed for KG building):
 #   python -m spacy download en_core_web_sm

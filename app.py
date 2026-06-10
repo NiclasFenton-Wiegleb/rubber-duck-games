@@ -3,22 +3,28 @@ HuggingFace Space entry point — Rubber Duck Games.
 
 This single process does three things on startup:
 
-  1. Configures the environment for a GPU Space (mounts the storage bucket path,
-     selects CUDA, eager-loads the model) and boots the Flask backend in a
+  1. Configures the environment for a ZeroGPU Space (mounts the storage bucket
+     path, pins CUDA as the model device) and boots the Flask backend in a
      background thread so its local APIs are available at 127.0.0.1:5000.
-  2. Warms up the heavy pieces once: the system prompt (from file), the
-     knowledge-graph retrieval indexes (from the mounted storage), and the small
-     language model (onto the GPU). Because Flask runs in the *same* process,
-     these singletons are shared with the API handlers.
+  2. Warms up the lightweight pieces once: the system prompt (from file) and the
+     knowledge-graph retrieval indexes (from the mounted storage). The model is
+     NOT loaded here — on ZeroGPU there is no persistent GPU, so the model is
+     loaded and run inside a @spaces.GPU function on the first query instead.
   3. Serves a minimal Gradio UI (a single text box) that submits prompts through
-     the "simple request" workstream by calling the local Flask API, and shows
-     the raw response for testing / debugging.
+     the "simple request" workstream. Generation runs directly inside the
+     @spaces.GPU function (`_generate_simple`) so the on-demand GPU is attached
+     to the call; the raw response is shown for testing / debugging.
 
 HuggingFace runs this file because README.md declares `sdk: gradio` and
 `app_file: app.py`. Gradio binds the public port (7860); Flask stays internal.
 """
 
 from __future__ import annotations
+
+# Import `spaces` FIRST — before torch is imported anywhere — so the ZeroGPU
+# runtime can patch torch's CUDA layer. On ZeroGPU there is no persistent GPU;
+# one is attached only while a @spaces.GPU-decorated function is executing.
+import spaces  # noqa: E402
 
 import importlib.util
 import json
@@ -49,8 +55,11 @@ def _configure_environment() -> str:
     """Pick sensible Space defaults; honour anything already set in the env."""
     os.environ.setdefault("HOST", "127.0.0.1")
     os.environ.setdefault("PORT", "5000")
-    # Load the model at startup (not lazily) so the first request is fast.
-    os.environ.setdefault("LLM_LAZY_LOAD", "false")
+    # ZeroGPU: there is NO persistent GPU at startup, so the model must not be
+    # eager-loaded (that would initialise CUDA in the parent process and break
+    # ZeroGPU's on-demand allocation). Force lazy load — the weights are loaded
+    # on the first @spaces.GPU call instead.
+    os.environ["LLM_LAZY_LOAD"] = "true"
     # Flask debug reloader must stay off inside a background thread.
     os.environ.setdefault("FLASK_DEBUG", "false")
 
@@ -59,13 +68,12 @@ def _configure_environment() -> str:
         default_storage = "/data" if Path("/data").exists() else str(BACKEND_DIR / "artifacts")
         os.environ["KG_STORAGE_DIR"] = default_storage
 
-    # Select the GPU when available.
-    if "LLM_DEVICE" not in os.environ:
-        try:
-            import torch  # noqa: WPS433 (lazy, optional)
-            os.environ["LLM_DEVICE"] = "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            os.environ["LLM_DEVICE"] = "auto"
+    # ZeroGPU: a CUDA device is only visible *inside* a @spaces.GPU function, so
+    # torch.cuda.is_available() is False at startup. Pin the device to "cuda"
+    # unconditionally — the model is loaded and run within the GPU-decorated
+    # path (_generate_simple), where the device is actually attached. We avoid
+    # importing torch / probing CUDA here to keep the parent process CUDA-clean.
+    os.environ.setdefault("LLM_DEVICE", "cuda")
 
     return os.environ["KG_STORAGE_DIR"]
 
@@ -105,12 +113,18 @@ def _run_backend():
 
 
 def _warmup():
-    """Mount/verify storage, load the system prompt, KG indexes and the model."""
+    """Mount/verify storage, load the system prompt and the KG indexes.
+
+    NOTE: We deliberately do NOT load the model here. On ZeroGPU the model must
+    be loaded and run inside a @spaces.GPU function (`_generate_simple`) so that
+    a GPU is actually attached; loading it now (in this background thread) would
+    initialise CUDA in the parent process and break ZeroGPU's on-demand
+    allocation. The model therefore loads lazily on the first query.
+    """
     cfg = flask_app.config
     try:
         from api.services.prompt_service import get_system_prompt
         from api.services.retrieval_service import get_retrieval_service
-        from api.services.llm_service import get_llm_service
 
         log.info("Warm-up: loading system prompt …")
         prompt = get_system_prompt(cfg)
@@ -122,10 +136,7 @@ def _warmup():
         STATE["kgs"] = retrieval.kg_names
         log.info("Warm-up: knowledge graphs found: %s", STATE["kgs"] or "(none)")
 
-        log.info("Warm-up: loading model onto %s …", STATE["device"])
-        get_llm_service(cfg).load()
-        log.info("Warm-up: model loaded.")
-
+        log.info("Warm-up: model will load lazily on the first GPU request.")
         STATE["ready"] = True
     except Exception as exc:  # noqa: BLE001 - surface to the UI
         STATE["error"] = str(exc)
@@ -176,31 +187,48 @@ def backend_status() -> str:
     return "  |  ".join(parts)
 
 
+@spaces.GPU(duration=120)
+def _generate_simple(message: str, use_context: bool, max_new_tokens: int,
+                     temperature: float) -> dict:
+    """Run one "simple request" generation on an on-demand ZeroGPU device.
+
+    This is the ONLY place the model touches CUDA. ZeroGPU attaches a GPU for
+    the duration of this call, so BOTH the first-time model load and every
+    generation must happen inside it — not in the background Flask thread, whose
+    separate call stack would NOT have a GPU attached. We therefore call the
+    in-process LLM service singleton directly here rather than going through the
+    internal Flask HTTP endpoint.
+
+    `duration=120` gives headroom for the first call, which also downloads /
+    loads the multi-GB model into the GPU before generating.
+    """
+    from api.services.llm_service import get_llm_service
+
+    llm = get_llm_service(flask_app.config)
+    return llm.generate_simple(
+        message,
+        max_new_tokens=int(max_new_tokens),
+        temperature=float(temperature),
+        use_context=bool(use_context),
+    )
+
+
 def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float):
-    """Submit a prompt through the simple-request workstream (via the API)."""
+    """Submit a prompt through the simple-request workstream (on ZeroGPU)."""
     message = (message or "").strip()
     if not message:
         return "Please enter a prompt.", "{}"
 
-    payload = {
-        "query": message,
-        "use_context": bool(use_context),
-        "max_new_tokens": int(max_new_tokens),
-        "temperature": float(temperature),
-    }
-
     try:
-        resp = requests.post(f"{BACKEND_URL}/api/query", json=payload, timeout=600)
-        data = resp.json()
+        result = _generate_simple(message, use_context, max_new_tokens, temperature)
     except Exception as exc:  # noqa: BLE001
-        return f"⚠️ Could not reach backend: {exc}", json.dumps({"error": str(exc)}, indent=2)
+        return f"⚠️ Generation failed: {exc}", json.dumps({"error": str(exc)}, indent=2)
 
+    data = {"status": "ok", "mode": "simple", "query": message, **result}
     raw = json.dumps(data, indent=2, ensure_ascii=False)
-    if data.get("status") != "ok":
-        return f"⚠️ Backend error: {data.get('message', 'unknown error')}", raw
 
-    answer = data.get("answer", "")
-    sources = data.get("sources") or []
+    answer = result.get("answer", "")
+    sources = result.get("sources") or []
     if sources:
         src_lines = "\n".join(
             f"- `{s.get('kg')}` · chunk {s.get('chunk_id')} · score {s.get('score')}"
