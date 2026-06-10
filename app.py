@@ -187,7 +187,33 @@ def backend_status() -> str:
     return "  |  ".join(parts)
 
 
-@spaces.GPU(duration=120)
+# ── ZeroGPU duration / quota ─────────────────────────────────────────────────
+# `duration` is NOT "how long the GPU runs" — it is the amount of quota ZeroGPU
+# RESERVES UP FRONT for the call. Any unused portion is refunded when the call
+# returns, BUT if `duration` exceeds the quota you have left *right now*, the
+# call is rejected outright with:
+#     "exceeded your ZeroGPU quota (<duration>s requested vs. <remaining>s left)"
+# So we keep this modest (and tunable) instead of reserving a big block. The
+# first call still has to load the multi-GB model, so it needs more headroom
+# than later calls — hence a separate, larger first-load reservation.
+GPU_DURATION = int(os.getenv("ZEROGPU_DURATION", "60"))
+GPU_LOAD_DURATION = int(os.getenv("ZEROGPU_LOAD_DURATION", "120"))
+
+
+def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
+                  temperature: float) -> int:
+    """Reserve more quota only for the (one-off) first call that loads weights."""
+    try:
+        from api.services.llm_service import get_llm_service
+
+        if not get_llm_service(flask_app.config).is_loaded:
+            return GPU_LOAD_DURATION
+    except Exception:
+        return GPU_LOAD_DURATION
+    return GPU_DURATION
+
+
+@spaces.GPU(duration=_gpu_duration)
 def _generate_simple(message: str, use_context: bool, max_new_tokens: int,
                      temperature: float) -> dict:
     """Run one "simple request" generation on an on-demand ZeroGPU device.
@@ -199,10 +225,12 @@ def _generate_simple(message: str, use_context: bool, max_new_tokens: int,
     in-process LLM service singleton directly here rather than going through the
     internal Flask HTTP endpoint.
 
-    `duration=120` gives headroom for the first call, which also downloads /
-    loads the multi-GB model into the GPU before generating.
+    The reserved quota is computed by `_gpu_duration`: a larger block for the
+    first call (which downloads/loads the multi-GB model) and a small block for
+    every subsequent generation, so we don't needlessly exhaust the quota.
     """
     from api.services.llm_service import get_llm_service
+
 
     llm = get_llm_service(flask_app.config)
     return llm.generate_simple(
