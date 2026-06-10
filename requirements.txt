@@ -1,8 +1,32 @@
 # HuggingFace Space dependencies (installed from the repo root).
-# Pulls in the full backend stack, then adds the Gradio UI layer.
+# Self-contained: HF mounts only this file during the build, so we cannot use
+# "-r backend/requirements.txt". Keep this in sync with backend/requirements.txt.
 
--r backend/requirements.txt
+# ── Web framework ──────────────────────────────────────────────
+Flask>=3.0
+flask-cors>=4.0
+python-dotenv>=1.0
+
+# ── Knowledge Graph pipeline ───────────────────────────────────
+networkx>=3.2
+beautifulsoup4>=4.12
+lxml>=5.0
+spacy>=3.7
+sentence-transformers>=2.7
+# Use faiss-gpu instead if running on a CUDA machine.
+faiss-cpu>=1.8
+numpy>=1.26
+huggingface_hub>=0.23
+tqdm>=4.66
+
+# ── Local small language model ─────────────────────────────────
+torch>=2.2
+transformers>=4.44
+accelerate>=0.30
 
 # ── Gradio frontend + local API client ─────────────────────────
 gradio>=5.0
 requests>=2.31
+
+# After install, download the spaCy English model (only needed for KG building):
+#   python -m spacy download en_core_web_sm
