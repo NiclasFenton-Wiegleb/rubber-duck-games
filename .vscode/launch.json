@@ -1,0 +1,64 @@
+{
+  // VS Code debug configurations for the Rubber Duck Games backend.
+  // Set breakpoints in backend/api/services/knowledge_graph_service.py and
+  // launch "Debug KG pipeline (test script)" to step through the build/upload.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug KG pipeline (test script)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/test_kg_pipeline.py",
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        // Replace with the local folder you want to ingest:
+        "${input:sourcePath}"
+      ]
+    },
+    {
+      "name": "Debug KG pipeline (direct, no HTTP)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/test_kg_pipeline.py",
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "${input:sourcePath}",
+        "--direct"
+      ]
+    },
+    {
+      "name": "Debug KG pipeline (build only, no upload)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/test_kg_pipeline.py",
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": [
+        "${input:sourcePath}",
+        "--no-upload"
+      ]
+    },
+    {
+      "name": "Run Flask backend (app.py)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/backend/app.py",
+      "cwd": "${workspaceFolder}/backend",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ],
+  "inputs": [
+    {
+      "id": "sourcePath",
+      "type": "promptString",
+      "description": "Local folder to ingest into the knowledge graph",
+      "default": "../test-repo"
+    }
+  ]
+}

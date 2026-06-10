@@ -1,0 +1,17 @@
+{
+  "source_path": "test-repo",
+  "total_chunks": 32,
+  "total_nodes": 210,
+  "total_edges": 817,
+  "embed_model": "BAAI/bge-small-en-v1.5",
+  "embed_dim": 384,
+  "chunk_size": 400,
+  "chunk_overlap": 60,
+  "files": {
+    "chunks": "data/chunks/chunks.jsonl",
+    "graph": "data/kg/graph.pkl",
+    "entity_map": "data/kg/entity_to_chunks.json",
+    "faiss_index": "data/faiss/index.faiss",
+    "node_id_map": "data/faiss/node_id_map.json"
+  }
+}
