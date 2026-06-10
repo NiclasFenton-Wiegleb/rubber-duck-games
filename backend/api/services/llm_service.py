@@ -58,24 +58,52 @@ class LLMService:
             if self._model is not None:
                 return
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import AutoModelForCausalLM
 
             device_map = "auto"
+
             if self.device_pref in ("cpu", "cuda"):
                 device_map = {"": self.device_pref}
 
-            self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            self._tokenizer = self._load_tokenizer()
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
                 torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
                 device_map=device_map,
             )
 
+    def _load_tokenizer(self):
+        """
+        Load the tokenizer for ``self.model_id``.
+
+        Some checkpoints (e.g. ones saved with a bleeding-edge / dev build of
+        ``transformers``) write ``"tokenizer_class": "TokenizersBackend"`` into
+        their ``tokenizer_config.json``. Older ``transformers`` releases don't
+        know that class, so ``AutoTokenizer`` raises::
+
+            ValueError: Tokenizer class TokenizersBackend does not exist or is
+            not currently imported.
+
+        We first try the normal ``AutoTokenizer`` path, then fall back to
+        loading the fast tokenizer directly from ``tokenizer.json`` (which
+        bypasses the ``tokenizer_class`` lookup entirely while still picking up
+        the chat template and special tokens from ``tokenizer_config.json``).
+        """
+        from transformers import AutoTokenizer
+
+        try:
+            return AutoTokenizer.from_pretrained(self.model_id)
+        except (ValueError, KeyError):
+            from transformers import PreTrainedTokenizerFast
+
+            return PreTrainedTokenizerFast.from_pretrained(self.model_id)
+
     @property
     def is_loaded(self) -> bool:
         return self._model is not None
 
     # ── Public generation methods ─────────────────────────────────────────────
+
     def generate_simple(self, query: str, max_new_tokens=None, temperature=None,
                          use_context=True) -> dict:
         """
