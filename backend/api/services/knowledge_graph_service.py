@@ -4,7 +4,11 @@ Knowledge Graph service.
 Walks a designated folder, parses every text-like file, chunks the content,
 builds a NetworkX knowledge graph (doc / section / chunk / entity nodes),
 embeds the chunks into a FAISS index, writes a manifest, and (optionally)
-uploads all artifacts to a HuggingFace Space storage bucket.
+uploads all artifacts to HuggingFace storage.
+
+By default the artifacts are pushed to a HuggingFace **Storage Bucket**
+(huggingface.co/buckets/<id>). Set HF_STORAGE_BACKEND=repo to instead commit
+them into the Space/dataset git repo (Files tab).
 
 This generalises the pipeline from RubberDuckGames.ipynb so it works on any
 folder of files rather than only Sphinx-built Godot HTML.
@@ -82,10 +86,15 @@ class KnowledgeGraphService:
         }
 
         uploaded = []
+        storage = None
         if upload:
             uploaded = self._upload(artifacts)
+            storage = self._storage_info()
 
-        return {"stats": stats, "artifacts": artifacts, "uploaded": uploaded}
+        result = {"stats": stats, "artifacts": artifacts, "uploaded": uploaded}
+        if storage is not None:
+            result["storage"] = storage
+        return result
 
     # ── Step 1: read + chunk files ──────────────────────────────────────────
     def _collect_chunks(self, src: Path) -> list[dict]:
@@ -295,11 +304,11 @@ class KnowledgeGraphService:
             "chunk_size": self.chunk_size,
             "chunk_overlap": self.chunk_overlap,
             "files": {
-                "chunks": "data/chunks/chunks.jsonl",
-                "graph": "data/kg/graph.pkl",
-                "entity_map": "data/kg/entity_to_chunks.json",
-                "faiss_index": "data/faiss/index.faiss",
-                "node_id_map": "data/faiss/node_id_map.json",
+                "chunks": "data/repo-kg/chunks/chunks.jsonl",
+                "graph": "data/repo-kg/kg/graph.pkl",
+                "entity_map": "data/repo-kg/kg/entity_to_chunks.json",
+                "faiss_index": "data/repo-kg/faiss/index.faiss",
+                "node_id_map": "data/repo-kg/faiss/node_id_map.json",
             },
         }
         path = self.out_dir / "manifest.json"
@@ -308,22 +317,10 @@ class KnowledgeGraphService:
         return path
 
     # ── Step 5: upload to HuggingFace ───────────────────────────────────────
-    def _upload(self, artifacts: dict) -> list[str]:
-        from huggingface_hub import HfApi
-
-        token = self.config["HF_TOKEN"]
-        if not token:
-            raise RuntimeError(
-                "HF_TOKEN is not set — cannot upload artifacts. "
-                "Set it in backend/.env or pass upload=false."
-            )
-
-        api = HfApi(token=token)
-        repo_id = self.config["HF_REPO_ID"]
-        repo_type = self.config["HF_REPO_TYPE"]
+    def _artifact_key_mapping(self) -> dict:
+        """Map artifact keys → destination paths (shared by bucket & repo)."""
         data_dir = self.config["HF_DATA_DIR"]
-
-        mapping = {
+        return {
             "manifest": f"{data_dir}/manifest.json",
             "chunks": f"{data_dir}/chunks/chunks.jsonl",
             "graph": f"{data_dir}/kg/graph.pkl",
@@ -331,6 +328,64 @@ class KnowledgeGraphService:
             "faiss_index": f"{data_dir}/faiss/index.faiss",
             "node_id_map": f"{data_dir}/faiss/node_id_map.json",
         }
+
+    def _storage_info(self) -> dict:
+        """Describe where artifacts were uploaded (for clients / cleanup)."""
+        backend = str(self.config.get("HF_STORAGE_BACKEND", "bucket")).lower()
+        if backend == "bucket":
+            return {"backend": "bucket", "id": self.config["HF_BUCKET_ID"]}
+        return {
+            "backend": "repo",
+            "id": self.config["HF_REPO_ID"],
+            "repo_type": self.config["HF_REPO_TYPE"],
+        }
+
+    def _upload(self, artifacts: dict) -> list[str]:
+        token = self.config["HF_TOKEN"]
+        if not token:
+            raise RuntimeError(
+                "HF_TOKEN is not set — cannot upload artifacts. "
+                "Set it in backend/.env or pass upload=false."
+            )
+
+        backend = str(self.config.get("HF_STORAGE_BACKEND", "bucket")).lower()
+        if backend == "bucket":
+            return self._upload_bucket(artifacts, token)
+        return self._upload_repo(artifacts, token)
+
+    def _upload_bucket(self, artifacts: dict, token: str) -> list[str]:
+        """Upload artifacts to a HuggingFace Storage Bucket."""
+        from huggingface_hub import batch_bucket_files, create_bucket
+
+        bucket_id = self.config["HF_BUCKET_ID"]
+        mapping = self._artifact_key_mapping()
+
+        # Ensure the bucket exists (no-op if it already does).
+        if self.config.get("HF_BUCKET_AUTO_CREATE", True):
+            try:
+                create_bucket(
+                    bucket_id,
+                    private=bool(self.config.get("HF_BUCKET_PRIVATE", True)),
+                    exist_ok=True,
+                    token=token,
+                )
+            except Exception:
+                # Bucket may already exist / lack create perms — keep going and
+                # let the upload surface any real error.
+                pass
+
+        add = [(artifacts[key], dest) for key, dest in mapping.items()]
+        batch_bucket_files(bucket_id, add=add, token=token)
+        return [dest for _, dest in mapping.items()]
+
+    def _upload_repo(self, artifacts: dict, token: str) -> list[str]:
+        """Commit artifacts into the Space/dataset git repo (Files tab)."""
+        from huggingface_hub import HfApi
+
+        api = HfApi(token=token)
+        repo_id = self.config["HF_REPO_ID"]
+        repo_type = self.config["HF_REPO_TYPE"]
+        mapping = self._artifact_key_mapping()
 
         uploaded = []
         for key, repo_path in mapping.items():

@@ -4,10 +4,11 @@ Small Language Model service.
 Loads the locally hosted, fine-tuned SmolLM3-3B model
 (`niclasfw/smollm3-3b-codex` by default) once and serves two kinds of output:
 
-  - generate_simple():  a direct, fast answer (no extended reasoning).
+  - generate_simple():  a direct, fast answer (no extended reasoning). Implements
+                        the full "simple request" workstream: file-based system
+                        prompt + multi-KG context retrieval + SLM generation.
   - generate_complex(): a richer answer using SmolLM3's "thinking" mode and,
-                        optionally, Knowledge-Graph / RAG context retrieved from
-                        the artifacts produced by KnowledgeGraphService.
+                        optionally, Knowledge-Graph / RAG context.
 
 The model is heavy, so we keep a process-wide singleton and (by default) load
 it lazily on the first request. Transformers/torch are imported lazily so the
@@ -75,18 +76,48 @@ class LLMService:
         return self._model is not None
 
     # ── Public generation methods ─────────────────────────────────────────────
-    def generate_simple(self, query: str, max_new_tokens=None, temperature=None) -> dict:
-        """Direct answer — no extended reasoning."""
+    def generate_simple(self, query: str, max_new_tokens=None, temperature=None,
+                         use_context=True) -> dict:
+        """
+        Direct, fast answer — no extended reasoning.
+
+        Implements the full "simple request" workstream:
+          1. system prompt is loaded from a local text file (cached),
+          2. the most relevant context across all KGs in the storage bucket is
+             retrieved and injected (skippable via use_context=False),
+          3. the assembled prompt is run straight through the SLM,
+          4. the answer + provenance is returned for the frontend.
+        """
+        from api.services.prompt_service import get_system_prompt
+
+        system = get_system_prompt(self.config)
+
+        context, sources = "", []
+        if use_context:
+            context, sources = self._retrieve_context(query)
+
+        user = query
+        if context:
+            user = (
+                "Use the following reference context if relevant:\n\n"
+                f"{context}\n\nQuestion: {query}"
+            )
+
         messages = [
-            {"role": "system", "content": "You are a concise, helpful coding assistant. /no_think"},
-            {"role": "user", "content": query},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ]
         answer = self._chat(
             messages,
             max_new_tokens=max_new_tokens or self.default_max_new,
             temperature=temperature if temperature is not None else self.default_temperature,
         )
-        return {"answer": answer.strip(), "reasoning": None}
+        return {
+            "answer": answer.strip(),
+            "reasoning": None,
+            "context_used": bool(context),
+            "sources": sources,
+        }
 
     def generate_complex(self, query: str, use_context=True,
                          max_new_tokens=None, temperature=None) -> dict:
@@ -95,7 +126,10 @@ class LLMService:
         injects Knowledge-Graph / RAG context. Splits out the model's
         <think>...</think> trace into a separate `reasoning` field.
         """
-        context = self._retrieve_context(query) if use_context else ""
+        context, sources = ("", [])
+        if use_context:
+            context, sources = self._retrieve_context(query)
+
         system = (
             "You are an expert coding assistant. Think step by step, consider "
             "edge cases, and produce a thorough, well-structured answer with "
@@ -119,6 +153,7 @@ class LLMService:
             "answer": answer.strip(),
             "reasoning": reasoning.strip() if reasoning else None,
             "context_used": bool(context),
+            "sources": sources,
         }
 
     # ── Internals ──────────────────────────────────────────────────────────────
@@ -155,40 +190,19 @@ class LLMService:
             return match.group(1), match.group(2)
         return None, text
 
-    def _retrieve_context(self, query: str, top_k: int = 4) -> str:
+    def _retrieve_context(self, query: str) -> tuple[str, list[dict]]:
         """
-        Best-effort RAG retrieval from locally built KG/FAISS artifacts.
+        Retrieve the most relevant context across *all* knowledge graphs in the
+        attached storage, via the shared (cached) RetrievalService.
 
-        Returns an empty string if the artifacts or dependencies are missing,
-        so the complex endpoint still works without a built knowledge graph.
+        Returns (context_text, sources). Degrades to ("", []) if no KGs or the
+        retrieval dependencies are missing, so generation still works.
         """
         try:
-            import json
-            from pathlib import Path
+            from api.services.retrieval_service import get_retrieval_service
 
-            import faiss
-            from sentence_transformers import SentenceTransformer
-
-            out_dir = Path(self.config["KG_OUTPUT_DIR"])
-            index_path = out_dir / "faiss" / "index.faiss"
-            chunks_path = out_dir / "chunks" / "chunks.jsonl"
-            if not index_path.exists() or not chunks_path.exists():
-                return ""
-
-            index = faiss.read_index(str(index_path))
-            embedder = SentenceTransformer(self.config["EMBED_MODEL"])
-            q_emb = embedder.encode(
-                [f"query: {query}"], normalize_embeddings=True, convert_to_numpy=True
-            )
-            _, ids = index.search(q_emb, top_k)
-
-            wanted = {int(i) for i in ids[0] if i != -1}
-            texts = []
-            with open(chunks_path, encoding="utf-8") as f:
-                for line in f:
-                    rec = json.loads(line)
-                    if rec["chunk_id"] in wanted:
-                        texts.append(f"- {rec['text']}")
-            return "\n".join(texts)
+            retrieval = get_retrieval_service(self.config)
+            result = retrieval.retrieve(query)
+            return result.get("context", ""), result.get("sources", [])
         except Exception:
-            return ""
+            return "", []

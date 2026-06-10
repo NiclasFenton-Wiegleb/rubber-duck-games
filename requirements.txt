@@ -1,0 +1,8 @@
+# HuggingFace Space dependencies (installed from the repo root).
+# Pulls in the full backend stack, then adds the Gradio UI layer.
+
+-r backend/requirements.txt
+
+# ── Gradio frontend + local API client ─────────────────────────
+gradio>=5.0
+requests>=2.31

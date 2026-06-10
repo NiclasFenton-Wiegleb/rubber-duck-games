@@ -35,7 +35,17 @@ class Config:
     HF_TOKEN = os.getenv("HF_TOKEN")
     HF_REPO_ID = os.getenv("HF_REPO_ID", "niclasfw/rubber-duck-games")
     HF_REPO_TYPE = os.getenv("HF_REPO_TYPE", "space")  # space | dataset | model
-    HF_DATA_DIR = os.getenv("HF_DATA_DIR", "data")  # path-in-repo prefix
+    HF_DATA_DIR = os.getenv("HF_DATA_DIR", "data")  # path-in-repo / bucket-key prefix
+
+    # Where the KG artifacts are stored:
+    #   "bucket" → HuggingFace Storage Bucket (huggingface.co/buckets/<id>)
+    #   "repo"   → committed into the Space/dataset git repo (Files tab)
+    HF_STORAGE_BACKEND = os.getenv("HF_STORAGE_BACKEND", "bucket").lower()
+    # Bucket id (namespace/name). Defaults to the same id as the repo.
+    HF_BUCKET_ID = os.getenv("HF_BUCKET_ID", HF_REPO_ID)
+    # Create the bucket automatically if it doesn't exist yet.
+    HF_BUCKET_AUTO_CREATE = os.getenv("HF_BUCKET_AUTO_CREATE", "true").lower() == "true"
+    HF_BUCKET_PRIVATE = os.getenv("HF_BUCKET_PRIVATE", "true").lower() == "true"
 
     # ── Knowledge Graph pipeline ────────────────────────────────────────────
     # Local working directory where artifacts are written before upload.
@@ -44,11 +54,35 @@ class Config:
     # Default folder to ingest if the request doesn't specify one.
     KG_SOURCE_PATH = os.getenv("KG_SOURCE_PATH", str(BASE_DIR.parent / "test-repo"))
 
+    # Name of the knowledge graph being built. Becomes its subfolder name in
+    # both the local artifacts dir and the storage bucket so multiple KGs can
+    # coexist, e.g. <storage>/godot-docs/faiss/index.faiss.
+    KG_NAME = os.getenv("KG_NAME", "default")
+
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "400"))      # target tokens / chunk
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "60"))  # overlap tokens
 
     EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
     EMBED_BATCH = int(os.getenv("EMBED_BATCH", "64"))
+
+    # ── Retrieval (multi-KG context for queries) ────────────────────────────
+    # Root of the attached storage that holds one or more knowledge graphs,
+    # each in its own subfolder (<root>/<kg-name>/{faiss,chunks,manifest.json}).
+    # On a HuggingFace Space with the bucket mounted this is typically "/data";
+    # locally we fall back to KG_OUTPUT_DIR.
+    KG_STORAGE_DIR = Path(
+        os.getenv("KG_STORAGE_DIR", os.getenv("KG_OUTPUT_DIR", str(BASE_DIR / "artifacts")))
+    )
+    # How many chunks to pull from each KG before merging.
+    RETRIEVAL_PER_KG_K = int(os.getenv("RETRIEVAL_PER_KG_K", "8"))
+    # How many chunks to keep in the final merged context across all KGs.
+    RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "4"))
+
+    # ── Prompting ───────────────────────────────────────────────────────────
+    # Local text file holding the system prompt prepended to every query.
+    SYSTEM_PROMPT_PATH = os.getenv(
+        "SYSTEM_PROMPT_PATH", str(BASE_DIR / "prompts" / "system_prompt.txt")
+    )
 
     # ── Small Language Model ────────────────────────────────────────────────
     # The fine-tuned SmolLM3-3B produced by the notebook pipeline.

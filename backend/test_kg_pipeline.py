@@ -8,11 +8,12 @@ What it does
 2. Takes a local filepath you pass on the command line and feeds it to the
    `POST /api/knowledge-graph/build` endpoint as `source_path`.
 3. The endpoint builds the Knowledge Graph (chunks → NetworkX graph → FAISS
-   index → manifest) and uploads every artifact to the configured HuggingFace
-   Space.
+   index → manifest) and uploads every artifact to HuggingFace storage. By
+   default this is a HuggingFace **Storage Bucket**
+   (https://huggingface.co/buckets/<id>); set HF_STORAGE_BACKEND=repo in
+   backend/.env to commit to the Space git repo instead.
 4. When the build finishes, the script deletes every uploaded artifact back
-   off the HuggingFace Space again (clean-up), so you don't leave test data
-   behind.
+   off HuggingFace again (clean-up), so you don't leave test data behind.
 
 Why it's debuggable
 -------------------
@@ -27,7 +28,7 @@ Usage
     # From the backend/ directory (so config + imports resolve):
     cd backend
 
-    # Build + upload + auto-cleanup the artifacts afterwards:
+    # Build + upload to the bucket + auto-cleanup afterwards:
     python test_kg_pipeline.py "C:/path/to/folder/to/ingest"
 
     # Build + upload but KEEP the artifacts on HuggingFace (no cleanup):
@@ -101,24 +102,84 @@ def _wait_for_health(base_url: str, timeout: float = 15.0) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HuggingFace cleanup
+# HuggingFace reporting + cleanup (bucket- and repo-aware)
 # ─────────────────────────────────────────────────────────────────────────────
-def cleanup_hf_artifacts(config, uploaded_paths: list[str]) -> None:
-    """Delete every uploaded artifact path back off the HuggingFace repo."""
+def _storage_url(storage: dict) -> str:
+    """Human-facing URL where the uploaded artifacts can be viewed."""
+    backend = storage.get("backend")
+    sid = storage.get("id")
+    if backend == "bucket":
+        return f"https://huggingface.co/buckets/{sid}"
+    repo_type = storage.get("repo_type", "space")
+    prefix = {"space": "spaces", "dataset": "datasets"}.get(repo_type, "")
+    return f"https://huggingface.co/{prefix + '/' if prefix else ''}{sid}/tree/main"
+
+
+def report_uploaded(storage: dict | None, uploaded_paths: list[str]) -> None:
+    """Tell the user exactly where the uploaded artifacts can be viewed."""
+    if not uploaded_paths or not storage:
+        return
+    backend = storage.get("backend", "?")
+    print(f"[upload] {len(uploaded_paths)} artifact(s) pushed to "
+          f"{backend}:{storage.get('id')}")
+    print(f"[upload] View them here: {_storage_url(storage)}")
+
+
+def cleanup_hf_artifacts(config, storage: dict | None,
+                         uploaded_paths: list[str]) -> None:
+    """Delete every uploaded artifact back off HuggingFace (bucket or repo)."""
     if not uploaded_paths:
         print("[cleanup] Nothing was uploaded — nothing to delete.")
         return
-
-    from huggingface_hub import HfApi
 
     token = config["HF_TOKEN"]
     if not token:
         print("[cleanup] HF_TOKEN not set — skipping cleanup.")
         return
 
+    backend = (storage or {}).get("backend") \
+        or str(config.get("HF_STORAGE_BACKEND", "bucket")).lower()
+
+    if backend == "bucket":
+        _cleanup_bucket(config, storage, uploaded_paths, token)
+    else:
+        _cleanup_repo(config, storage, uploaded_paths, token)
+
+
+def _cleanup_bucket(config, storage, uploaded_paths, token) -> None:
+    from huggingface_hub import batch_bucket_files, list_bucket_tree
+
+    bucket_id = (storage or {}).get("id") or config["HF_BUCKET_ID"]
+    print(f"[cleanup] Deleting {len(uploaded_paths)} object(s) from "
+          f"bucket:{bucket_id} ...")
+    try:
+        batch_bucket_files(bucket_id, delete=list(uploaded_paths), token=token)
+        for p in uploaded_paths:
+            print(f"  ✓ deleted {p}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ✗ bucket delete failed: {exc}")
+        return
+
+    # Verify the objects are actually gone.
+    try:
+        remaining = {item.path for item in
+                     list_bucket_tree(bucket_id, token=token)}
+        still = [p for p in uploaded_paths if p in remaining]
+        if still:
+            print(f"[cleanup] WARNING — still present after delete: {still}")
+        else:
+            print(f"[cleanup] Verified: all artifacts removed from "
+                  f"bucket:{bucket_id}.")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[cleanup] Could not verify deletion: {exc}")
+
+
+def _cleanup_repo(config, storage, uploaded_paths, token) -> None:
+    from huggingface_hub import HfApi
+
     api = HfApi(token=token)
-    repo_id = config["HF_REPO_ID"]
-    repo_type = config["HF_REPO_TYPE"]
+    repo_id = (storage or {}).get("id") or config["HF_REPO_ID"]
+    repo_type = (storage or {}).get("repo_type") or config["HF_REPO_TYPE"]
 
     print(f"[cleanup] Deleting {len(uploaded_paths)} file(s) from "
           f"{repo_type}:{repo_id} ...")
@@ -131,8 +192,19 @@ def cleanup_hf_artifacts(config, uploaded_paths: list[str]) -> None:
                 commit_message=f"[test cleanup] Remove {repo_path}",
             )
             print(f"  ✓ deleted {repo_path}")
-        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+        except Exception as exc:  # noqa: BLE001
             print(f"  ✗ failed to delete {repo_path}: {exc}")
+
+    try:
+        remaining = set(api.list_repo_files(repo_id=repo_id, repo_type=repo_type))
+        still = [p for p in uploaded_paths if p in remaining]
+        if still:
+            print(f"[cleanup] WARNING — still present after delete: {still}")
+        else:
+            print(f"[cleanup] Verified: all artifacts removed from "
+                  f"{repo_type}:{repo_id}.")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[cleanup] Could not verify deletion: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,7 +267,7 @@ def run_direct(config, source_path: str, upload: bool) -> dict:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Build a Knowledge Graph from a local folder, upload it to "
-                    "the HuggingFace Space, then delete it again.",
+                    "HuggingFace storage, then delete it again.",
     )
     parser.add_argument(
         "source_path",
@@ -263,9 +335,13 @@ def main(argv: list[str]) -> int:
         return 1
 
     uploaded = result.get("uploaded", []) if isinstance(result, dict) else []
+    storage = result.get("storage") if isinstance(result, dict) else None
+
+    if args.upload:
+        report_uploaded(storage, uploaded)
 
     if args.upload and args.cleanup:
-        cleanup_hf_artifacts(config, uploaded)
+        cleanup_hf_artifacts(config, storage, uploaded)
     elif args.upload and not args.cleanup:
         print(f"[cleanup] --no-cleanup set; left {len(uploaded)} file(s) on "
               "HuggingFace.")

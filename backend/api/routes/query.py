@@ -2,10 +2,16 @@
 Query APIs — run a user query through the locally hosted small language model.
 
 POST /api/query
-    Simple, fast answer. Runs the prompt straight through the SLM.
+    Simple, fast answer (the "simple request" workstream):
+      1. system prompt is loaded from a local text file,
+      2. the most relevant context across all Knowledge Graphs in the attached
+         storage bucket is retrieved and added to the prompt,
+      3. the assembled prompt is run straight through the SLM on the local GPU,
+      4. the formatted answer + sources are returned.
 
     Request JSON:
         { "query": "How do I move a KinematicBody2D?",
+          "use_context": true,         # optional, pull KG context (default true)
           "max_new_tokens": 512,        # optional
           "temperature": 0.7 }          # optional
 
@@ -25,6 +31,8 @@ Both return:
           "query": "...",
           "answer": "...",
           "reasoning": "...",           # complex endpoint only (may be null)
+          "context_used": true|false,
+          "sources": [ { "kg": ..., "chunk_id": ..., "score": ... }, ... ],
           "mode": "simple" | "complex" }
 """
 
@@ -35,10 +43,10 @@ from api.services.llm_service import get_llm_service
 query_bp = Blueprint("query", __name__)
 
 
-def _extract_query() -> str | None:
+def _extract_query():
     payload = request.get_json(silent=True) or {}
     query = (payload.get("query") or "").strip()
-    return query or None, payload
+    return (query or None), payload
 
 
 @query_bp.post("/query")
@@ -53,6 +61,7 @@ def query_simple():
             query,
             max_new_tokens=payload.get("max_new_tokens"),
             temperature=payload.get("temperature"),
+            use_context=payload.get("use_context", True),
         )
     except Exception as exc:  # noqa: BLE001
         current_app.logger.exception("Simple query failed")
