@@ -87,7 +87,7 @@ class Config:
     # ── Small Language Model ────────────────────────────────────────────────
     # The fine-tuned SmolLM3-3B produced by the notebook pipeline.
     LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "niclasfw/smollm3-3b-codex")
-    LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")  # auto | cpu | cuda
+    LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")  # auto | cpu | cuda | mps
     LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "512"))
     LLM_COMPLEX_MAX_NEW_TOKENS = int(os.getenv("LLM_COMPLEX_MAX_NEW_TOKENS", "2048"))
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
