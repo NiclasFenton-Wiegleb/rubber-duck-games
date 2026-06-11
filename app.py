@@ -44,6 +44,14 @@ BACKEND_DIR = ROOT_DIR / "backend"
 # Make the backend package importable (config.py, api/...).
 sys.path.insert(0, str(BACKEND_DIR))
 
+from api.services.structured_output import (  # noqa: E402
+    normalize_structured_answer,
+    render_duck_questions,
+    render_fix_options,
+    render_refactor,
+    render_repo_findings,
+)
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -438,6 +446,12 @@ APP_CSS = """
     margin: 0 !important;
 }
 
+.conversation [role="tabpanel"],
+.conversation .tabitem {
+    background: transparent !important;
+    border: 0 !important;
+}
+
 .conversation > .block:first-child {
     margin-left: -16px !important;
     margin-right: -16px !important;
@@ -490,8 +504,118 @@ APP_CSS = """
 .chat-card p,
 .chat-card li,
 .info-card p,
-.info-card strong {
+.info-card strong,
+.info-card ul,
+.info-card ol,
+.info-card li {
     color: #243247 !important;
+}
+
+.info-card {
+    line-height: 1.45;
+}
+
+.info-card ul,
+.info-card ol {
+    margin: 8px 0 10px 20px;
+    padding: 0;
+}
+
+.info-card li {
+    margin: 4px 0;
+}
+
+.info-card li,
+.info-card li *,
+.info-card li::marker {
+    color: #243247 !important;
+    opacity: 1 !important;
+}
+
+.info-card .evidence-list {
+    list-style-position: outside;
+}
+
+.info-card .evidence-file {
+    color: #172033 !important;
+    font-weight: 800;
+}
+
+.info-card .evidence-symbol,
+.info-card .evidence-reason {
+    color: #40516a !important;
+    font-weight: 650;
+}
+
+.info-card .fix-steps,
+.info-card .fix-step,
+.info-card .fix-step-index,
+.info-card .fix-tradeoffs,
+.info-card .fix-tradeoff,
+.info-card .fix-tradeoffs-heading {
+    color: #172033 !important;
+    opacity: 1 !important;
+    -webkit-text-fill-color: #172033 !important;
+}
+
+.info-card .fix-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 0 0;
+}
+
+.info-card .fix-step {
+    display: block;
+    line-height: 1.45;
+}
+
+.info-card .fix-step-index {
+    color: #40516a !important;
+    -webkit-text-fill-color: #40516a !important;
+    font-weight: 800;
+    margin-right: 6px;
+}
+
+.info-card .fix-tradeoffs-heading {
+    margin: 12px 0 6px;
+}
+
+.info-card .fix-tradeoffs {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0 0 4px;
+}
+
+.info-card .fix-tradeoff {
+    display: block;
+    line-height: 1.45;
+    padding-left: 14px;
+    position: relative;
+}
+
+.info-card .fix-tradeoff:before {
+    color: #40516a !important;
+    content: "•";
+    left: 0;
+    position: absolute;
+}
+
+.prose .info-card .fix-steps,
+.prose .info-card .fix-step,
+.prose .info-card .fix-tradeoffs,
+.prose .info-card .fix-tradeoff,
+.prose .info-card .fix-tradeoffs-heading,
+.prose .info-card .fix-step-index {
+    color: #172033 !important;
+    opacity: 1 !important;
+    -webkit-text-fill-color: #172033 !important;
+}
+
+.structured-panel.prose :where(ol, ul, li) {
+    color: inherit !important;
+    opacity: 1 !important;
 }
 
 .repo-pill,
@@ -506,22 +630,22 @@ APP_CSS = """
 
 .repo-pill {
     background: #e8f7f4;
-    color: #17675f;
+    color: #0b5f58;
 }
 
 .tag-blue {
     background: #eaf1ff;
-    color: #3561b7;
+    color: #244f9f;
 }
 
 .tag-gold {
     background: #fff0cd;
-    color: #94621a;
+    color: #764812;
 }
 
 .tag-green {
     background: #e5f7ef;
-    color: #24704d;
+    color: #17633e;
 }
 
 .confidence-bar {
@@ -826,11 +950,205 @@ def _repo_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
     )
 
 
+def _repo_followup_prompt(repo: str, branch: str, destination: str, problem: str, followup: str) -> str:
+    return "\n".join(
+        [
+            _repo_prompt(repo, branch, destination, problem),
+            "",
+            "The user is continuing the same debugging conversation.",
+            "Their latest reply or observation:",
+            (followup or "").strip(),
+            "",
+            "Respond in the same structured duck session format. Update the duck questions, repo findings, "
+            "fix options, and refactor suggestion based on this follow-up.",
+        ]
+    )
+
+
+PREVIEW_STRUCTURED_OUTPUT = {
+    "schema_version": "1.0",
+    "session": {
+        "mode": "duck_question",
+        "repo": {
+            "url": "https://github.com/user/platformer-game",
+            "branch": "main",
+            "local_path": "./runs/duck-repo-copy",
+        },
+        "user_problem": "The player does not move when I press the arrow keys.",
+    },
+    "conversation": {
+        "messages": [
+            {
+                "id": "preview_q1",
+                "role": "duck",
+                "kind": "question",
+                "content": "When you press an arrow key, do you see any input value change if you print the movement vector?",
+                "intent": "confirm_input_signal",
+                "expects_user_reply": True,
+            },
+            {
+                "id": "preview_q2",
+                "role": "duck",
+                "kind": "question",
+                "content": "Is the movement code running inside the physics update, or only once when the scene loads?",
+                "intent": "locate_update_loop",
+                "expects_user_reply": True,
+            },
+            {
+                "id": "preview_q3",
+                "role": "duck",
+                "kind": "question",
+                "content": "Does the player node have a collision body that might be blocked immediately at spawn?",
+                "intent": "check_collision_blocker",
+                "expects_user_reply": True,
+            },
+        ],
+        "next_prompt_hint": "Try one tiny check first: print the input vector while pressing left and right.",
+    },
+    "repo_findings": [
+        {
+            "id": "preview_finding_1",
+            "title": "Movement depends on named input actions",
+            "summary": "The player script appears to read action names, so the Input Map must contain the same names.",
+            "evidence": [
+                {
+                    "file": "player/player.gd",
+                    "symbol": "_physics_process",
+                    "reason": "Reads left/right actions every frame before applying velocity.",
+                },
+                {
+                    "file": "project.godot",
+                    "symbol": "input",
+                    "reason": "This is where Godot stores project-level input action bindings.",
+                },
+            ],
+            "confidence": "high",
+            "learning_opportunity": {
+                "concept": "Input actions",
+                "why_it_matters": "Actions let code ask for intent, like move_left, instead of a specific keyboard key.",
+                "beginner_explanation": "If the action name in code is not registered in the project settings, pressing the key can look like nothing is happening.",
+                "suggested_next_step": "Open Project Settings > Input Map and compare the action names with the player script.",
+            },
+        },
+        {
+            "id": "preview_finding_2",
+            "title": "The update loop may be the right place to test first",
+            "summary": "Movement bugs are easier to isolate when you confirm the frame-by-frame update is actually running.",
+            "evidence": [
+                {
+                    "file": "player/player.gd",
+                    "symbol": "_physics_process",
+                    "reason": "Expected place for physics movement and collision-aware motion.",
+                }
+            ],
+            "confidence": "medium",
+            "learning_opportunity": {
+                "concept": "Game loop debugging",
+                "why_it_matters": "A movement assignment that runs only once will not respond continuously to input.",
+                "beginner_explanation": "Games re-check input many times per second; a single startup check is usually not enough for movement.",
+                "suggested_next_step": "Add one temporary print inside the physics update and verify it repeats while the scene runs.",
+            },
+        },
+    ],
+    "fix_options": [
+        {
+            "id": "preview_fix_1",
+            "area": "input",
+            "title": "Align the Input Map with the player script",
+            "description": "Create or rename the missing actions so the code and project settings use the same names.",
+            "complexity": "low",
+            "risk": "low",
+            "recommended": True,
+            "steps": [
+                "Find the action names read by the player script.",
+                "Add matching actions in Project Settings > Input Map.",
+                "Bind arrow keys or WASD to those actions.",
+                "Run the scene and test one direction at a time.",
+            ],
+            "tradeoffs": [
+                "Smallest change and easiest to verify.",
+                "Does not clean up broader movement structure.",
+            ],
+        },
+        {
+            "id": "preview_fix_2",
+            "area": "movement",
+            "title": "Add a temporary movement trace",
+            "description": "Print the calculated input vector and velocity before changing gameplay code.",
+            "complexity": "low",
+            "risk": "low",
+            "recommended": False,
+            "steps": [
+                "Print the input vector inside the physics update.",
+                "Press each movement key and watch the output.",
+                "Remove the print once the failing step is clear.",
+            ],
+            "tradeoffs": [
+                "Adds temporary noise to the console.",
+                "Helps avoid changing the wrong part of the code.",
+            ],
+        },
+    ],
+    "refactor_suggestion": {
+        "title": "Name movement actions after intent",
+        "reason": "Once movement works, action names like move_left and jump will be easier to scan than engine defaults or key-specific names.",
+        "when_to_do_it": "after_fix",
+        "scope": "Input Map entries and the small section of player movement code that reads them.",
+    },
+}
+
+PREVIEW_STRUCTURED, _ = normalize_structured_answer(json.dumps(PREVIEW_STRUCTURED_OUTPUT))
+PREVIEW_DUCK_QUESTIONS = render_duck_questions(PREVIEW_STRUCTURED)
+PREVIEW_REPO_FINDINGS = render_repo_findings(PREVIEW_STRUCTURED)
+PREVIEW_FIX_OPTIONS = render_fix_options(PREVIEW_STRUCTURED)
+PREVIEW_REFACTOR = render_refactor(PREVIEW_STRUCTURED)
+PREVIEW_RAW_RESPONSE = json.dumps(PREVIEW_STRUCTURED, indent=2)
+
+
+def _render_structured_response(raw_answer: str, raw_json: str, repo: str, branch: str,
+                                destination: str, problem: str):
+    structured, error = normalize_structured_answer(
+        raw_answer,
+        repo_url=repo,
+        branch=branch,
+        local_path=str(_resolve_destination(destination)),
+        user_problem=problem,
+    )
+    raw_payload = json.loads(raw_json) if raw_json and raw_json.strip().startswith("{") else {"raw": raw_json}
+    raw_payload["structured_preview_error"] = error
+    raw_payload["structured"] = structured
+    return (
+        render_duck_questions(structured),
+        render_repo_findings(structured),
+        render_fix_options(structured),
+        render_refactor(structured),
+        json.dumps(raw_payload, indent=2, ensure_ascii=False),
+    )
+
+
 def ask_repo(repo: str, branch: str, destination: str, problem: str,
              use_context: bool, max_new_tokens: int, temperature: float):
     prompt = _repo_prompt(repo, branch, destination, problem)
     answer, raw = ask(prompt, use_context, max_new_tokens, temperature)
-    return gr.update(visible=True), answer, raw
+    return _render_structured_response(answer, raw, repo, branch, destination, problem)
+
+
+def continue_repo_conversation(repo: str, branch: str, destination: str, problem: str, followup: str,
+                               use_context: bool, max_new_tokens: int, temperature: float):
+    followup = (followup or "").strip()
+    if not followup:
+        return gr.update(), ""
+
+    prompt = _repo_followup_prompt(repo, branch, destination, problem, followup)
+    answer, raw = ask(prompt, use_context, max_new_tokens, temperature)
+    structured, _ = normalize_structured_answer(
+        answer,
+        repo_url=repo,
+        branch=branch,
+        local_path=str(_resolve_destination(destination)),
+        user_problem=problem,
+    )
+    return render_duck_questions(structured), ""
 
 
 def repo_summary_html(repo: str, branch: str, destination: str) -> str:
@@ -915,66 +1233,32 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                     )
                     problem_submit = gr.Button("Ask the duck", variant="primary", elem_classes=["primary-duck"])
 
-                    with gr.Group(visible=False) as results_panel:
-                        with gr.Tabs(selected="duck_questions"):
-                            with gr.Tab("Duck Questions", id="duck_questions"):
-                                gr.HTML(
-                                    """
-                                    <div class="chat-thread">
-                                        <div class="chat-line">
-                                            <div class="avatar">D</div>
-                                            <div class="chat-card">
-                                                <div class="card-kicker">Duck</div>
-                                                <ol>
-                                                    <li>...?</li>
-                                                </ol>
-                                            </div>
-                                        </div>
-                                        <div class="chat-line">
-                                            <div class="avatar">You</div>
-                                            <div class="chat-card">
-                                                <div class="card-kicker">Your turn</div>
-                                                Describe the broken behavior in one or two sentences.
-                                            </div>
-                                        </div>
-                                    </div>
-                                    """
-                                )
-                            with gr.Tab("Repo Findings"):
-                                gr.HTML(
-                                    """
-                                    <div class="info-card">
-                                        <div class="card-kicker">Repo Findings</div>
-                                        Clone the project to give the duck file-level context for its suggestions.
-                                        <div><span class="repo-pill">Reveal 2-3 possible fixes</span></div>
-                                    </div>
-                                    """
-                                )
-                            with gr.Tab("Fix Options"):
-                                answer = gr.Markdown("Ask the duck to generate focused fix options from the repo context.")
-                            with gr.Tab("Refactor"):
-                                gr.HTML(
-                                    """
-                                    <div class="stack-list">
-                                        <div class="info-card">
-                                            <div class="card-kicker">Refactor Suggestion</div>
-                                            Prefer a small, testable change first. Once the failing behavior is pinned down,
-                                            the duck will suggest whether the surrounding system deserves a cleanup.
-                                        </div>
-                                        <div class="info-card">
-                                            <div class="card-kicker">Confidence</div>
-                                            Likely repo/test ownership issue
-                                            <div class="confidence-bar"><div></div></div>
-                                            <span class="tag tag-blue">repo</span>
-                                            <span class="tag tag-green">tests</span>
-                                            <span class="tag tag-gold">race risk</span>
-                                        </div>
-                                    </div>
-                                    """
-                                )
+                    with gr.Tabs(selected="duck_questions"):
+                        with gr.Tab("Duck Questions", id="duck_questions"):
+                            duck_questions = gr.HTML(value=PREVIEW_DUCK_QUESTIONS)
+                            followup_input = gr.Textbox(
+                                label="Continue the conversation",
+                                placeholder="e.g. I printed the vector and it stays (0, 0) when I press left.",
+                                lines=2,
+                                elem_classes=["compact-input"],
+                            )
+                            followup_submit = gr.Button(
+                                "Reply to the duck",
+                                variant="primary",
+                                elem_classes=["primary-duck"],
+                            )
+                        with gr.Tab("Repo Findings"):
+                            repo_findings = gr.HTML(value=PREVIEW_REPO_FINDINGS)
+                        with gr.Tab("Fix Options"):
+                            fix_options = gr.HTML(
+                                value=PREVIEW_FIX_OPTIONS,
+                                elem_classes=["structured-panel"],
+                            )
+                        with gr.Tab("Refactor"):
+                            refactor = gr.HTML(value=PREVIEW_REFACTOR)
 
-                        with gr.Accordion("Raw response", open=False):
-                            raw_json = gr.Code(label="JSON", language="json")
+                    with gr.Accordion("Raw response", open=False):
+                        raw_json = gr.Code(value=PREVIEW_RAW_RESPONSE, label="JSON", language="json")
 
     clone_button.click(
         clone_project,
@@ -1002,7 +1286,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             max_new_tokens,
             temperature,
         ],
-        outputs=[results_panel, answer, raw_json],
+        outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
     )
     problem_input.submit(
         ask_repo,
@@ -1015,7 +1299,35 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             max_new_tokens,
             temperature,
         ],
-        outputs=[results_panel, answer, raw_json],
+        outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
+    )
+    followup_submit.click(
+        continue_repo_conversation,
+        inputs=[
+            repo_input,
+            branch_input,
+            destination_input,
+            problem_input,
+            followup_input,
+            use_context,
+            max_new_tokens,
+            temperature,
+        ],
+        outputs=[duck_questions, followup_input],
+    )
+    followup_input.submit(
+        continue_repo_conversation,
+        inputs=[
+            repo_input,
+            branch_input,
+            destination_input,
+            problem_input,
+            followup_input,
+            use_context,
+            max_new_tokens,
+            temperature,
+        ],
+        outputs=[duck_questions, followup_input],
     )
     for component in [repo_input, branch_input]:
         component.change(
@@ -1031,4 +1343,8 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
 if __name__ == "__main__":
     # Give the backend a moment to come up so the first status read is accurate.
     _wait_for_backend(timeout=15)
-    demo.queue().launch(server_name="0.0.0.0", server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")))
+    demo.queue().launch(
+        server_name="0.0.0.0",
+        server_port=int(os.getenv("GRADIO_SERVER_PORT", "7860")),
+        css=APP_CSS,
+    )

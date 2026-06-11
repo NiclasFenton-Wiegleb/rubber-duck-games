@@ -241,7 +241,6 @@ def _normalize_fix_options(structured: dict[str, Any]) -> None:
                 "title": title,
                 "description": _clean_text(raw.get("description")),
                 "complexity": _clean_level(raw.get("complexity")),
-                "legibility": _clean_level(raw.get("legibility")),
                 "risk": _clean_level(raw.get("risk")),
                 "recommended": _clean_bool(raw.get("recommended"), index == 1),
                 "steps": _clean_string_list(raw.get("steps")),
@@ -308,12 +307,19 @@ def render_repo_findings(structured: dict[str, Any]) -> str:
     cards = []
     for finding in findings:
         evidence = "".join(
-            '<li>'
-            f'<strong>{html.escape(_clean_text(item.get("file"), "Unknown file"))}</strong>'
-            f' {html.escape(_clean_text(item.get("symbol")))}'
-            f' - {html.escape(_clean_text(item.get("reason")))}'
+            '<li class="evidence-item" style="color:#243247; opacity:1;">'
+            f'<strong class="evidence-file" style="color:#172033; font-weight:800;">'
+            f'{html.escape(_clean_text(item.get("file"), "Unknown file"))}</strong>'
+            f' <span class="evidence-symbol" style="color:#40516a; font-weight:650;">'
+            f'{html.escape(_clean_text(item.get("symbol")))}</span>'
+            f' <span class="evidence-reason" style="color:#40516a; font-weight:650;">'
+            f'- {html.escape(_clean_text(item.get("reason")))}</span>'
             '</li>'
             for item in finding.get("evidence", [])
+        )
+        evidence_list = (
+            f'<ul class="evidence-list" style="color:#243247; opacity:1;">{evidence}</ul>'
+            if evidence else ""
         )
         learning = finding.get("learning_opportunity", {})
         cards.append(
@@ -321,7 +327,7 @@ def render_repo_findings(structured: dict[str, Any]) -> str:
             f'<div class="card-kicker">Repo Finding - {html.escape(_clean_text(finding.get("confidence"), "medium"))}</div>'
             f'<strong>{html.escape(_clean_text(finding.get("title")))}</strong>'
             f'<p>{html.escape(_clean_text(finding.get("summary")))}</p>'
-            f'{"<ul>" + evidence + "</ul>" if evidence else ""}'
+            f'{evidence_list}'
             f'<span class="tag tag-blue">{html.escape(_clean_text(learning.get("concept"), "Learning opportunity"))}</span>'
             f'<p><strong>Why it matters:</strong> {html.escape(_clean_text(learning.get("why_it_matters")))}</p>'
             f'<p><strong>Beginner note:</strong> {html.escape(_clean_text(learning.get("beginner_explanation")))}</p>'
@@ -354,8 +360,23 @@ def render_fix_options(structured: dict[str, Any], requested_area: str = "") -> 
         )
     cards = []
     for option in options:
-        steps = "".join(f"<li>{html.escape(step)}</li>" for step in option.get("steps", []))
-        tradeoffs = "".join(f"<li>{html.escape(item)}</li>" for item in option.get("tradeoffs", []))
+        steps = "".join(
+            f'<div class="fix-step">'
+            f'<span class="fix-step-index">{index}.</span>'
+            f'{html.escape(step)}'
+            f'</div>'
+            for index, step in enumerate(option.get("steps", []), start=1)
+        )
+        tradeoffs = "".join(
+            f'<div class="fix-tradeoff">{html.escape(item)}</div>'
+            for item in option.get("tradeoffs", [])
+        )
+        steps_list = f'<div class="fix-steps">{steps}</div>' if steps else ""
+        tradeoffs_list = (
+            '<p class="fix-tradeoffs-heading"><strong>Tradeoffs</strong></p>'
+            f'<div class="fix-tradeoffs">{tradeoffs}</div>'
+            if tradeoffs else ""
+        )
         recommended = '<span class="tag tag-green">recommended</span>' if option.get("recommended") else ""
         cards.append(
             '<div class="info-card">'
@@ -364,10 +385,9 @@ def render_fix_options(structured: dict[str, Any], requested_area: str = "") -> 
             f'<p>{html.escape(_clean_text(option.get("description")))}</p>'
             f'{recommended}'
             f'<span class="tag tag-blue">complexity: {html.escape(_clean_text(option.get("complexity"), "medium"))}</span>'
-            f'<span class="tag tag-green">legibility: {html.escape(_clean_text(option.get("legibility"), "medium"))}</span>'
             f'<span class="tag tag-gold">risk: {html.escape(_clean_text(option.get("risk"), "medium"))}</span>'
-            f'{"<ol>" + steps + "</ol>" if steps else ""}'
-            f'{"<p><strong>Tradeoffs</strong></p><ul>" + tradeoffs + "</ul>" if tradeoffs else ""}'
+            f'{steps_list}'
+            f'{tradeoffs_list}'
             '</div>'
         )
     return f'<div class="stack-list">{"".join(cards)}</div>'

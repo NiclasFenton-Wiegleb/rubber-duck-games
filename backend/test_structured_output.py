@@ -72,7 +72,6 @@ class StructuredOutputTests(unittest.TestCase):
                         "title": "Add missing action",
                         "description": "Create the input action used by the player script.",
                         "complexity": "low",
-                        "legibility": "high",
                         "risk": "low",
                         "recommended": True,
                         "steps": ["Add ui_right", "Test movement"],
@@ -153,7 +152,7 @@ class StructuredOutputTests(unittest.TestCase):
         self.assertIn("Layers decide what can touch.", html)
         self.assertIn("Inspect the player and floor masks.", html)
 
-    def test_fix_options_render_complexity_legibility_and_recommendation(self):
+    def test_fix_options_render_complexity_risk_and_recommendation(self):
         structured, _ = normalize_structured_answer(
             json.dumps(
                 {
@@ -163,7 +162,6 @@ class StructuredOutputTests(unittest.TestCase):
                             "title": "Fix input map",
                             "description": "Add the missing action.",
                             "complexity": "low",
-                            "legibility": "high",
                             "risk": "low",
                             "recommended": True,
                             "steps": ["Add action"],
@@ -174,7 +172,6 @@ class StructuredOutputTests(unittest.TestCase):
                             "title": "Rewrite movement",
                             "description": "Replace the movement function.",
                             "complexity": "high",
-                            "legibility": "medium",
                             "risk": "high",
                             "recommended": False,
                         },
@@ -186,7 +183,7 @@ class StructuredOutputTests(unittest.TestCase):
         html = render_fix_options(structured, requested_area="input")
 
         self.assertIn("complexity: low", html)
-        self.assertIn("legibility: high", html)
+        self.assertIn("risk: low", html)
         self.assertIn("recommended", html)
         self.assertIn("Fix input map", html)
         self.assertNotIn("Rewrite movement", html)
