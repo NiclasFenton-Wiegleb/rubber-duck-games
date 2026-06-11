@@ -60,17 +60,34 @@ class LLMService:
             import torch
             from transformers import AutoModelForCausalLM
 
-            device_map = "auto"
-
-            if self.device_pref in ("cpu", "cuda"):
-                device_map = {"": self.device_pref}
+            device = self._resolve_device(torch)
+            device_map = {"": device}
+            dtype = self._dtype_for_device(torch, device)
 
             self._tokenizer = self._load_tokenizer()
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+                torch_dtype=dtype,
                 device_map=device_map,
             )
+
+    def _resolve_device(self, torch) -> str:
+        """Pick the best available local device for model inference."""
+        if self.device_pref in ("cpu", "cuda", "mps"):
+            return self.device_pref
+        if torch.cuda.is_available():
+            return "cuda"
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    @staticmethod
+    def _dtype_for_device(torch, device: str):
+        if device == "cuda":
+            return torch.bfloat16
+        if device == "mps":
+            return torch.float16
+        return torch.float32
 
     def _load_tokenizer(self):
         """
