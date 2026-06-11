@@ -830,7 +830,7 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
              use_context: bool, max_new_tokens: int, temperature: float):
     prompt = _repo_prompt(repo, branch, destination, problem)
     answer, raw = ask(prompt, use_context, max_new_tokens, temperature)
-    return answer, raw
+    return gr.update(visible=True), answer, raw
 
 
 def repo_summary_html(repo: str, branch: str, destination: str) -> str:
@@ -915,65 +915,66 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                     )
                     problem_submit = gr.Button("Ask the duck", variant="primary", elem_classes=["primary-duck"])
 
-                    with gr.Tabs(selected="duck_questions"):
-                        with gr.Tab("Duck Questions", id="duck_questions"):
-                            gr.HTML(
-                                """
-                                <div class="chat-thread">
-                                    <div class="chat-line">
-                                        <div class="avatar">D</div>
-                                        <div class="chat-card">
-                                            <div class="card-kicker">Duck</div>
-                                            <ol>
-                                                <li>...?</li>
-                                            </ol>
+                    with gr.Group(visible=False) as results_panel:
+                        with gr.Tabs(selected="duck_questions"):
+                            with gr.Tab("Duck Questions", id="duck_questions"):
+                                gr.HTML(
+                                    """
+                                    <div class="chat-thread">
+                                        <div class="chat-line">
+                                            <div class="avatar">D</div>
+                                            <div class="chat-card">
+                                                <div class="card-kicker">Duck</div>
+                                                <ol>
+                                                    <li>...?</li>
+                                                </ol>
+                                            </div>
+                                        </div>
+                                        <div class="chat-line">
+                                            <div class="avatar">You</div>
+                                            <div class="chat-card">
+                                                <div class="card-kicker">Your turn</div>
+                                                Describe the broken behavior in one or two sentences.
+                                            </div>
                                         </div>
                                     </div>
-                                    <div class="chat-line">
-                                        <div class="avatar">You</div>
-                                        <div class="chat-card">
-                                            <div class="card-kicker">Your turn</div>
-                                            Describe the broken behavior in one or two sentences.
+                                    """
+                                )
+                            with gr.Tab("Repo Findings"):
+                                gr.HTML(
+                                    """
+                                    <div class="info-card">
+                                        <div class="card-kicker">Repo Findings</div>
+                                        Clone the project to give the duck file-level context for its suggestions.
+                                        <div><span class="repo-pill">Reveal 2-3 possible fixes</span></div>
+                                    </div>
+                                    """
+                                )
+                            with gr.Tab("Fix Options"):
+                                answer = gr.Markdown("Ask the duck to generate focused fix options from the repo context.")
+                            with gr.Tab("Refactor"):
+                                gr.HTML(
+                                    """
+                                    <div class="stack-list">
+                                        <div class="info-card">
+                                            <div class="card-kicker">Refactor Suggestion</div>
+                                            Prefer a small, testable change first. Once the failing behavior is pinned down,
+                                            the duck will suggest whether the surrounding system deserves a cleanup.
+                                        </div>
+                                        <div class="info-card">
+                                            <div class="card-kicker">Confidence</div>
+                                            Likely repo/test ownership issue
+                                            <div class="confidence-bar"><div></div></div>
+                                            <span class="tag tag-blue">repo</span>
+                                            <span class="tag tag-green">tests</span>
+                                            <span class="tag tag-gold">race risk</span>
                                         </div>
                                     </div>
-                                </div>
-                                """
-                            )
-                        with gr.Tab("Repo Findings"):
-                            gr.HTML(
-                                """
-                                <div class="info-card">
-                                    <div class="card-kicker">Repo Findings</div>
-                                    Clone the project to give the duck file-level context for its suggestions.
-                                    <div><span class="repo-pill">Reveal 2-3 possible fixes</span></div>
-                                </div>
-                                """
-                            )
-                        with gr.Tab("Fix Options"):
-                            answer = gr.Markdown("Ask the duck to generate focused fix options from the repo context.")
-                        with gr.Tab("Refactor"):
-                            gr.HTML(
-                                """
-                                <div class="stack-list">
-                                    <div class="info-card">
-                                        <div class="card-kicker">Refactor Suggestion</div>
-                                        Prefer a small, testable change first. Once the failing behavior is pinned down,
-                                        the duck will suggest whether the surrounding system deserves a cleanup.
-                                    </div>
-                                    <div class="info-card">
-                                        <div class="card-kicker">Confidence</div>
-                                        Likely repo/test ownership issue
-                                        <div class="confidence-bar"><div></div></div>
-                                        <span class="tag tag-blue">repo</span>
-                                        <span class="tag tag-green">tests</span>
-                                        <span class="tag tag-gold">race risk</span>
-                                    </div>
-                                </div>
-                                """
-                            )
+                                    """
+                                )
 
-                    with gr.Accordion("Raw response", open=False):
-                        raw_json = gr.Code(label="JSON", language="json")
+                        with gr.Accordion("Raw response", open=False):
+                            raw_json = gr.Code(label="JSON", language="json")
 
     clone_button.click(
         clone_project,
@@ -1001,7 +1002,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             max_new_tokens,
             temperature,
         ],
-        outputs=[answer, raw_json],
+        outputs=[results_panel, answer, raw_json],
     )
     problem_input.submit(
         ask_repo,
@@ -1014,7 +1015,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             max_new_tokens,
             temperature,
         ],
-        outputs=[answer, raw_json],
+        outputs=[results_panel, answer, raw_json],
     )
     for component in [repo_input, branch_input]:
         component.change(
