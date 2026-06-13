@@ -3,17 +3,17 @@ HuggingFace Space entry point — Rubber Duck Games.
 
 This single process does three things on startup:
 
-  1. Configures the environment for a ZeroGPU Space (mounts the storage bucket
-     path, pins CUDA as the model device) and boots the Flask backend in a
+  1. Configures the environment for a CPU-only Space (mounts the storage bucket
+     path, pins CPU as the model device) and boots the Flask backend in a
      background thread so its local APIs are available at 127.0.0.1:5000.
-  2. Warms up the lightweight pieces once: the system prompt (from file) and the
-     knowledge-graph retrieval indexes (from the mounted storage). The model is
-     NOT loaded here — on ZeroGPU there is no persistent GPU, so the model is
-     loaded and run inside a @spaces.GPU function on the first query instead.
+  2. Warms up everything once: the system prompt (from file), the knowledge-graph
+     retrieval indexes (from the mounted storage) and the model itself. On this
+     CPU-only runtime the model is eager-loaded at launch so the weights are
+     resident in memory before the first user query.
   3. Serves a minimal Gradio UI (a single text box) that submits prompts through
-     the "simple request" workstream. Generation runs directly inside the
-     @spaces.GPU function (`_generate_simple`) so the on-demand GPU is attached
-     to the call; the raw response is shown for testing / debugging.
+     the "simple request" workstream; the raw response is shown for testing /
+     debugging.
+
 
 HuggingFace runs this file because README.md declares `sdk: gradio` and
 `app_file: app.py`. Gradio binds the public port (7860); Flask stays internal.
@@ -65,30 +65,26 @@ def _configure_environment() -> str:
     """Pick sensible Space defaults; honour anything already set in the env."""
     os.environ.setdefault("HOST", "127.0.0.1")
     os.environ.setdefault("PORT", "5000")
-    # ZeroGPU: there is NO persistent GPU at startup, so the model must not be
-    # eager-loaded (that would initialise CUDA in the parent process and break
-    # ZeroGPU's on-demand allocation). Force lazy load — the weights are loaded
-    # on the first @spaces.GPU call instead.
-    os.environ["LLM_LAZY_LOAD"] = "true"
+    # CPU-only runtime: there is no GPU to manage, so eager-loading the model at
+    # startup is safe (it no longer risks initialising CUDA in the parent
+    # process). Disable lazy load so the weights are pulled into memory during
+    # warm-up, when the app launches, instead of on the first user query.
+    os.environ["LLM_LAZY_LOAD"] = "false"
     # Flask debug reloader must stay off inside a background thread.
     os.environ.setdefault("FLASK_DEBUG", "false")
+
 
     # Knowledge-graph storage: HF persistent storage is mounted at /data.
     if "KG_STORAGE_DIR" not in os.environ:
         default_storage = "/data" if Path("/data").exists() else str(BACKEND_DIR / "artifacts")
         os.environ["KG_STORAGE_DIR"] = default_storage
 
-    # ZeroGPU: a CUDA device is only visible *inside* a @spaces.GPU function, so
-    # torch.cuda.is_available() is False at startup. Pin the *preference* to
-    # "cuda" — the model is loaded and run within the GPU-decorated path
-    # (_generate_simple), where the device is actually attached. We avoid
-    # importing torch / probing CUDA here to keep the parent process CUDA-clean.
-    #
-    # This is only a preference: LLMService._resolve_device() re-checks GPU
-    # availability at load time (inside the GPU-decorated call) and transparently
-    # falls back to CPU when no GPU is present, so the same image runs on both
-    # GPU and CPU-only instances.
-    os.environ.setdefault("LLM_DEVICE", "cuda")
+    # CPU-only runtime: there is no GPU available, so pin the model device to
+    # "cpu". LLMService._resolve_device() honours this directly, and the model
+    # is eager-loaded onto the CPU during warm-up. (If this image is ever moved
+    # back onto a GPU instance, override LLM_DEVICE via the environment.)
+    os.environ.setdefault("LLM_DEVICE", "cpu")
+
 
 
     return os.environ["KG_STORAGE_DIR"]
@@ -129,16 +125,17 @@ def _run_backend():
 
 
 def _warmup():
-    """Mount/verify storage, load the system prompt and the KG indexes.
+    """Mount/verify storage, load the system prompt, the KG indexes and the model.
 
-    NOTE: We deliberately do NOT load the model here. On ZeroGPU the model must
-    be loaded and run inside a @spaces.GPU function (`_generate_simple`) so that
-    a GPU is actually attached; loading it now (in this background thread) would
-    initialise CUDA in the parent process and break ZeroGPU's on-demand
-    allocation. The model therefore loads lazily on the first query.
+    On this CPU-only runtime the model is eager-loaded here, at app launch, so
+    the weights are already resident in memory before the first user query. This
+    is safe because there is no GPU to manage (loading no longer risks
+    initialising CUDA in a context that breaks on-demand GPU allocation), so the
+    one-off load cost is paid up front rather than on the first query.
     """
     cfg = flask_app.config
     try:
+        from api.services.llm_service import get_llm_service
         from api.services.prompt_service import get_system_prompt
         from api.services.retrieval_service import get_retrieval_service
 
@@ -152,11 +149,18 @@ def _warmup():
         STATE["kgs"] = retrieval.kg_names
         log.info("Warm-up: knowledge graphs found: %s", STATE["kgs"] or "(none)")
 
-        log.info("Warm-up: model will load lazily on the first GPU request.")
+        log.info("Warm-up: loading model into memory …")
+        llm = get_llm_service(cfg)
+        llm.load()
+        if llm.device:
+            STATE["device"] = llm.device
+        log.info("Warm-up: model loaded on device '%s'.", llm.device)
+
         STATE["ready"] = True
     except Exception as exc:  # noqa: BLE001 - surface to the UI
         STATE["error"] = str(exc)
         log.exception("Warm-up failed")
+
 
 
 def _wait_for_backend(timeout: float = 30.0):
