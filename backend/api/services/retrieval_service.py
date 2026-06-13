@@ -68,6 +68,11 @@ class RetrievalService:
             storage = Path(__file__).resolve().parents[2] / "artifacts"
         self.storage_dir = Path(storage)
 
+        # Also track the output dir so locally-built KGs are found even when
+        # KG_STORAGE_DIR points somewhere else (e.g. /data on HF Spaces).
+        output = _cfg(config, "KG_OUTPUT_DIR")
+        self.output_dir = Path(output) if output else None
+
         self.embed_model_name = _cfg(config, "EMBED_MODEL", "BAAI/bge-small-en-v1.5")
         self.per_kg_k = int(_cfg(config, "RETRIEVAL_PER_KG_K", 8))
         self.top_k = int(_cfg(config, "RETRIEVAL_TOP_K", 4))
@@ -206,24 +211,33 @@ class RetrievalService:
             log.info("Retrieval: %d KG(s) loaded into memory", len(kgs))
 
     def _discover_kg_dirs(self) -> list[Path]:
-        """Find every KG folder under the storage root (subfolders or flat)."""
-        root = self.storage_dir
-        if not root.exists():
-            return []
+        """Find every KG folder under the storage root and (if different) the
+        local output dir.  This makes locally-built KGs immediately available
+        for RAG queries even when a storage bucket is also attached."""
+        roots: list[Path] = [self.storage_dir]
+        if self.output_dir is not None and self.output_dir != self.storage_dir:
+            roots.append(self.output_dir)
 
         found: list[Path] = []
-        for child in sorted(root.iterdir()):
-            if not child.is_dir():
+        seen: set[str] = set()  # dedupe by KG name
+        for root in roots:
+            if not root.exists():
                 continue
-            if (child / "faiss" / "index.faiss").exists() and \
-               (child / "chunks" / "chunks.jsonl").exists():
-                found.append(child)
-
-        # Fall back to a flat single-KG layout at the root itself.
-        if not found and (root / "faiss" / "index.faiss").exists() and \
-           (root / "chunks" / "chunks.jsonl").exists():
-            found.append(root)
-
+            for child in sorted(root.iterdir()):
+                if not child.is_dir():
+                    continue
+                if (child / "faiss" / "index.faiss").exists() and \
+                   (child / "chunks" / "chunks.jsonl").exists():
+                    name = child.name
+                    if name not in seen:
+                        found.append(child)
+                        seen.add(name)
+            # Fall back to a flat single-KG layout at the root itself.
+            if (root / "faiss" / "index.faiss").exists() and \
+               (root / "chunks" / "chunks.jsonl").exists():
+                if "default" not in seen:
+                    found.append(root)
+                    seen.add("default")
         return found
 
     @staticmethod

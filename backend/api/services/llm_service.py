@@ -253,9 +253,13 @@ class LLMService:
             return_tensors="pt",
         ).to(self._model.device)
 
-        input_len = inputs.shape[-1]
+        # apply_chat_template may return a BatchEncoding (dict-like wrapper)
+        # instead of a raw tensor.  Use .input_ids when available so .shape
+        # does not trigger __getattr__ → KeyError → AttributeError.
+        input_ids = inputs.input_ids if hasattr(inputs, "input_ids") else inputs
+        input_len = input_ids.shape[-1]
         log.debug("Tokenized %d input tokens on device '%s'",
-                  input_len, self._model.device)
+                   input_len, self._model.device)
 
         with torch.no_grad():
             output_ids = self._model.generate(
@@ -268,7 +272,7 @@ class LLMService:
             )
 
         # Only decode the newly generated tokens.
-        generated = output_ids[0][inputs.shape[-1]:]
+        generated = output_ids[0][input_len:]
         output_len = len(generated)
         decoded = self._tokenizer.decode(generated, skip_special_tokens=True)
 
