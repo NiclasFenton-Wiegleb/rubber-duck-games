@@ -2,7 +2,7 @@
   "source_path": "C:\\Users\\NiclasWiegleb\\projects\\rubber-duck-games\\runs\\duck-repo-copy",
   "total_chunks": 32,
   "total_nodes": 210,
-  "total_edges": 820,
+  "total_edges": 816,
   "embed_model": "BAAI/bge-small-en-v1.5",
   "embed_dim": 384,
   "chunk_size": 400,

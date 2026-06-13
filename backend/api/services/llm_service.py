@@ -261,14 +261,22 @@ class LLMService:
         log.debug("Tokenized %d input tokens on device '%s'",
                    input_len, self._model.device)
 
+        # Build kwargs for model.generate – pass the raw tensor and, if
+        # available, the attention_mask so the model knows what to ignore.
+        generate_kwargs: dict = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0,
+            "temperature": max(temperature, 1e-4),
+            "top_p": 0.95,
+            "pad_token_id": self._tokenizer.eos_token_id,
+        }
+        if hasattr(inputs, "attention_mask"):
+            generate_kwargs["attention_mask"] = inputs.attention_mask
+
         with torch.no_grad():
             output_ids = self._model.generate(
-                inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=temperature > 0,
-                temperature=max(temperature, 1e-4),
-                top_p=0.95,
-                pad_token_id=self._tokenizer.eos_token_id,
+                input_ids,
+                **generate_kwargs,
             )
 
         # Only decode the newly generated tokens.
