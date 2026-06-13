@@ -3,7 +3,7 @@ name: Sync to Hugging Face Space
 on:
   push:
     branches:
-      - backend  # Triggers on push to main
+      - main  # Triggers on push to main
 
 jobs:
   sync-to-hub:
