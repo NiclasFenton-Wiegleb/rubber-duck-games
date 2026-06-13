@@ -32,9 +32,14 @@ torch>=2.2
 # ("'list' object has no attribute 'keys'").
 transformers>=5.5.0
 accelerate>=0.30
+# 4-bit (NF4) weight quantization for faster, lower-VRAM GPU inference
+# (LLM_LOAD_IN_4BIT). Required for the fine-tuned SmolLM3 on the ZeroGPU Space.
+# CUDA-only; harmless on CPU-only boxes (skipped at load if CUDA is absent).
+bitsandbytes>=0.43; platform_system != "Darwin"
 
 
 # ── Gradio frontend + local API client ─────────────────────────
+
 # gradio>=5.47.1 dropped the removed `HfFolder` import, making it compatible
 # with huggingface_hub>=1.0 (required transitively by transformers>=5.5).
 gradio>=5.47.1

@@ -98,12 +98,89 @@ def _extract_json_object(raw_answer: str) -> dict[str, Any]:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    decoder = json.JSONDecoder()
     first_brace = text.find("{")
     if first_brace < 0:
         raise ValueError("No JSON object found in model response.")
-    parsed, _ = decoder.raw_decode(text[first_brace:])
-    return parsed
+    candidate = text[first_brace:]
+
+    # strict=False tolerates the literal control characters (newlines, tabs)
+    # that small models frequently emit *inside* JSON string values — the
+    # default strict decoder rejects them with "Invalid control character".
+    decoder = json.JSONDecoder(strict=False)
+
+    # 1) Try to decode the candidate as-is.
+    try:
+        return decoder.raw_decode(candidate)[0]
+    except JSONDecodeError:
+        pass
+
+    # 2) The answer was very likely cut off at the token budget, leaving an
+    #    unterminated string / unclosed braces. Repair it so the sections that
+    #    *did* complete still render instead of collapsing to an error card.
+    try:
+        return decoder.raw_decode(_repair_truncated_json(candidate))[0]
+    except JSONDecodeError as exc:
+        raise ValueError(f"Could not parse or repair JSON object: {exc}") from exc
+
+
+def _repair_truncated_json(text: str) -> str:
+    """Best-effort close of a truncated JSON object.
+
+    Walks the text tracking string state and the brace/bracket stack, then
+    closes whatever is still open (an unterminated string, dangling
+    key/colon/comma, and any unclosed ``{``/``[``). This turns a response that
+    was cut off mid-generation into a parseable object that keeps every fully
+    formed field.
+    """
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch in "}]" and stack:
+            stack.pop()
+
+    repaired = text
+    # Close an unterminated string value/key.
+    if in_str:
+        repaired += '"'
+
+    repaired = repaired.rstrip()
+    # A dangling key with no value yet (e.g. ``"risk":``) → give it null.
+    if repaired.endswith(":"):
+        repaired += " null"
+    # A trailing comma before we close would be invalid JSON.
+    if repaired.endswith(","):
+        repaired = repaired[:-1]
+
+    closing = "".join("}" if ch == "{" else "]" for ch in reversed(stack))
+    return repaired + closing
+
+
+def parse_partial_json(raw_answer: str) -> dict[str, Any] | None:
+    """Public, exception-free helper: return the parsed object or None.
+
+    Used by callers that generate the duck session one section at a time and
+    merge fragments together; a failed fragment simply contributes nothing.
+    """
+    try:
+        parsed = _extract_json_object(raw_answer)
+    except (TypeError, ValueError, JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
 
 
 def _merge_defaults(base: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:

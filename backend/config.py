@@ -98,10 +98,17 @@ class Config:
     # Any HuggingFace model id compatible with AutoModelForCausalLM.
     # Gemma 4 (and newer models) require AutoProcessor instead of AutoTokenizer.
     # Set via LLM_MODEL_ID env var.
-    LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "google/gemma-4-E4B-it")
+    LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "niclasfw/smollm3-3b-codex")
     LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")  # auto | cpu | cuda | mps
     LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "512"))
     LLM_COMPLEX_MAX_NEW_TOKENS = int(os.getenv("LLM_COMPLEX_MAX_NEW_TOKENS", "2048"))
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
     # Lazily load the model on first request rather than at startup.
     LLM_LAZY_LOAD = os.getenv("LLM_LAZY_LOAD", "true").lower() == "true"
+    # Load the model weights in 4-bit (bitsandbytes NF4). This quarters VRAM and
+    # speeds up generation on a single GPU (e.g. the fine-tuned SmolLM3 on a
+    # ZeroGPU instance). Requires CUDA + bitsandbytes; on CPU it is silently
+    # ignored and the model loads in its normal precision.
+    LLM_LOAD_IN_4BIT = os.getenv("LLM_LOAD_IN_4BIT", "true").lower() == "true"
+
+

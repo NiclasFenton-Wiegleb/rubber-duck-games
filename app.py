@@ -62,11 +62,13 @@ sys.path.insert(0, str(BACKEND_DIR))
 
 from api.services.structured_output import (  # noqa: E402
     normalize_structured_answer,
+    parse_partial_json,
     render_duck_questions,
     render_fix_options,
     render_refactor,
     render_repo_findings,
 )
+
 
 
 # ── Environment defaults (set BEFORE importing backend config) ───────────────
@@ -823,7 +825,7 @@ GPU_LOAD_DURATION = int(os.getenv("ZEROGPU_LOAD_DURATION", "120"))
 
 
 def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
-                  temperature: float) -> int:
+                  temperature: float, stop_on_json: bool = False) -> int:
     """Reserve more quota only for the (one-off) first call that loads weights."""
     try:
         from api.services.llm_service import get_llm_service
@@ -836,13 +838,13 @@ def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
 
 
 def _run_generation(message: str, use_context: bool, max_new_tokens: int,
-                    temperature: float) -> dict:
+                    temperature: float, stop_on_json: bool = False) -> dict:
     """Core generation logic — called directly or wrapped by @spaces.GPU."""
     from api.services.llm_service import get_llm_service
 
     log.info("Generation starting: message_len=%d, use_context=%s, "
-             "max_new_tokens=%d, temperature=%.2f",
-             len(message), use_context, max_new_tokens, temperature)
+             "max_new_tokens=%d, temperature=%.2f, stop_on_json=%s",
+             len(message), use_context, max_new_tokens, temperature, stop_on_json)
 
     t0 = time.time()
     llm = get_llm_service(flask_app.config)
@@ -851,8 +853,10 @@ def _run_generation(message: str, use_context: bool, max_new_tokens: int,
         max_new_tokens=int(max_new_tokens),
         temperature=float(temperature),
         use_context=bool(use_context),
+        stop_on_json=bool(stop_on_json),
     )
     elapsed = time.time() - t0
+
 
     # The device is only known after the (lazy) load runs. Reflect the device
     # the model actually landed on (e.g. "cpu" when no GPU was attached) so the
@@ -877,21 +881,30 @@ else:
     _generate_simple = _run_generation
 
 
-def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float):
-    """Submit a prompt through the simple-request workstream."""
+def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float,
+        stop_on_json: bool = False):
+    """Submit a prompt through the simple-request workstream.
+
+    ``stop_on_json=True`` lets the model stop the moment it has emitted a
+    complete JSON object — used by the structured duck-session flows so each
+    section returns quickly instead of padding out to the token budget.
+    """
     message = (message or "").strip()
     if not message:
         log.warning("ask() received empty message")
         return "Please enter a prompt.", "{}"
 
-    log.info("ask() called: message_len=%d, use_context=%s, max_new=%d, temp=%.2f",
-             len(message), use_context, max_new_tokens, temperature)
+    log.info("ask() called: message_len=%d, use_context=%s, max_new=%d, temp=%.2f, "
+             "stop_on_json=%s", len(message), use_context, max_new_tokens,
+             temperature, stop_on_json)
 
     try:
-        result = _generate_simple(message, use_context, max_new_tokens, temperature)
+        result = _generate_simple(message, use_context, max_new_tokens, temperature,
+                                  stop_on_json)
     except Exception as exc:  # noqa: BLE001
         log.exception("Generation failed: %s", exc)
         return f"⚠️ Generation failed: {exc}", json.dumps({"error": str(exc)}, indent=2)
+
 
     data = {"status": "ok", "mode": "simple", "query": message, **result}
     raw = json.dumps(data, indent=2, ensure_ascii=False)
@@ -1189,6 +1202,116 @@ def _repo_followup_prompt(repo: str, branch: str, destination: str, problem: str
     )
 
 
+# ── Per-section prompts (sequential, tab-by-tab generation) ──────────────────
+# Generating the full schema in one shot is slow and ties up every tab until
+# the very end. Instead we ask the model for one small section at a time, so
+# each call is short (fast to generate, stops on a complete JSON object) and the
+# corresponding tab can render the moment its section is ready.
+
+def _session_header(repo: str, branch: str, destination: str, problem: str) -> list[str]:
+    return [
+        "You are Rubber Duck Games, a friendly game development debugging assistant.",
+        "You reason from a duplicated Git project, not from a pasted snippet.",
+        "",
+        f"Repository: {(repo or '').strip() or '(not provided)'}",
+        f"Branch: {(branch or '').strip() or 'main'}",
+        f"Local copy: {str(_resolve_destination(destination))}",
+        "",
+        "Observed problem:",
+        (problem or "Help me inspect the project and decide what to test first.").strip(),
+        "",
+        "Respond ONLY with a single JSON object (no markdown, no text before or after the braces).",
+    ]
+
+
+def _duck_questions_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
+    return "\n".join(
+        _session_header(repo, branch, destination, problem)
+        + [
+            "Return EXACTLY this shape with up to 4 short diagnostic questions that guide",
+            "the user to find the cause themselves:",
+            "",
+            "{",
+            '  "conversation": {',
+            '    "messages": [',
+            '      {"id": "q1", "role": "duck", "kind": "question", "content": "<first diagnostic question>", "intent": "<why you ask this>", "expects_user_reply": true},',
+            '      {"id": "q2", "role": "duck", "kind": "question", "content": "<second question>", "intent": "<intent>", "expects_user_reply": true},',
+            '      {"id": "q3", "role": "duck", "kind": "question", "content": "<third question>", "intent": "<intent>", "expects_user_reply": true},',
+            '      {"id": "q4", "role": "duck", "kind": "question", "content": "<fourth question>", "intent": "<intent>", "expects_user_reply": true}',
+            "    ],",
+            '    "next_prompt_hint": "<a short hint for what the user could try next>"',
+            "  }",
+            "}",
+        ]
+    )
+
+
+def _repo_findings_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
+    return "\n".join(
+        _session_header(repo, branch, destination, problem)
+        + [
+            "Return EXACTLY this shape with 1-2 concrete findings grounded in the repo's files:",
+            "",
+            "{",
+            '  "repo_findings": [',
+            "    {",
+            '      "id": "finding_1",',
+            '      "title": "<finding title>",',
+            '      "summary": "<one-sentence finding summary>",',
+            '      "evidence": [{"file": "<relevant file>", "symbol": "<function/class>", "reason": "<why relevant>"}],',
+            '      "confidence": "low|medium|high",',
+            '      "learning_opportunity": {"concept": "<concept name>", "why_it_matters": "<explanation>", "beginner_explanation": "<beginner-friendly note>", "suggested_next_step": "<concrete next action>"}',
+            "    }",
+            "  ]",
+            "}",
+        ]
+    )
+
+
+def _fix_options_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
+    return "\n".join(
+        _session_header(repo, branch, destination, problem)
+        + [
+            "Return EXACTLY this shape with 1-2 focused fix options (mark one as recommended):",
+            "",
+            "{",
+            '  "fix_options": [',
+            "    {",
+            '      "id": "fix_1",',
+            '      "area": "input|movement|rendering|physics|audio|other",',
+            '      "title": "<fix title>",',
+            '      "description": "<what the fix does>",',
+            '      "complexity": "low|medium|high",',
+            '      "risk": "low|medium|high",',
+            '      "recommended": true,',
+            '      "steps": ["<step 1>", "<step 2>"],',
+            '      "tradeoffs": ["<tradeoff 1>"]',
+            "    }",
+            "  ]",
+            "}",
+        ]
+    )
+
+
+def _refactor_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
+    return "\n".join(
+        _session_header(repo, branch, destination, problem)
+        + [
+            "Return EXACTLY this shape with a single, small refactor suggestion:",
+            "",
+            "{",
+            '  "refactor_suggestion": {',
+            '    "title": "<refactor title>",',
+            '    "reason": "<why refactor>",',
+            '    "when_to_do_it": "now|after_fix|later",',
+            '    "scope": "<what files/concepts are affected>"',
+            "  }",
+            "}",
+        ]
+    )
+
+
+
 PREVIEW_STRUCTURED_OUTPUT = {
     "schema_version": "1.0",
     "session": {
@@ -1350,11 +1473,102 @@ def _render_structured_response(raw_answer: str, raw_json: str, repo: str, branc
     )
 
 
+def _pending_card(title: str) -> str:
+    """A small placeholder shown in a tab while its section is still generating."""
+    return (
+        f'<div class="info-card"><div class="card-kicker">{html.escape(title)}</div>'
+        'Generating… the duck is still working on this section.'
+        '</div>'
+    )
+
+
 def ask_repo(repo: str, branch: str, destination: str, problem: str,
              use_context: bool, max_new_tokens: int, temperature: float):
-    prompt = _repo_prompt(repo, branch, destination, problem)
-    answer, raw = ask(prompt, use_context, max_new_tokens, temperature)
-    return _render_structured_response(answer, raw, repo, branch, destination, problem)
+    """Generate the duck session one tab at a time and stream each as it's ready.
+
+    Rather than producing the whole schema in a single (slow) call that blocks
+    every tab until the end, we ask the model for one small section per call.
+    Each call is short — and stops the instant it emits a complete JSON object —
+    so Duck Questions can render while Repo Findings are still being generated,
+    and so on. This is a Gradio generator: each ``yield`` pushes a fresh set of
+    tab contents to the UI.
+    """
+    local_path = str(_resolve_destination(destination))
+
+    # Accumulate the raw section fragments; re-normalize the merged object after
+    # each step so every tab renders consistently (with defaults filled in).
+    accumulated: dict = {
+        "schema_version": "1.0",
+        "session": {
+            "mode": "duck_question",
+            "repo": {"url": repo, "branch": branch, "local_path": local_path},
+            "user_problem": problem,
+        },
+    }
+
+    def _structured() -> dict:
+        structured, _ = normalize_structured_answer(
+            json.dumps(accumulated),
+            repo_url=repo,
+            branch=branch,
+            local_path=local_path,
+            user_problem=problem,
+        )
+        return structured
+
+    def _raw(structured: dict) -> str:
+        return json.dumps(structured, indent=2, ensure_ascii=False)
+
+    sections = [
+        ("Duck Questions", _duck_questions_prompt, "duck_questions"),
+        ("Repo Findings", _repo_findings_prompt, "repo_findings"),
+        ("Fix Options", _fix_options_prompt, "fix_options"),
+        ("Refactor", _refactor_prompt, "refactor"),
+    ]
+
+    # Initial frame: everything pending so the user sees immediate feedback.
+    pending = {
+        "duck_questions": _pending_card("Duck Questions"),
+        "repo_findings": _pending_card("Repo Findings"),
+        "fix_options": _pending_card("Fix Options"),
+        "refactor": _pending_card("Refactor"),
+    }
+    yield (
+        pending["duck_questions"],
+        pending["repo_findings"],
+        pending["fix_options"],
+        pending["refactor"],
+        "{}",
+    )
+
+    rendered = dict(pending)
+    for title, prompt_fn, key in sections:
+        prompt = prompt_fn(repo, branch, destination, problem)
+        answer, _ = ask(prompt, use_context, max_new_tokens, temperature,
+                        stop_on_json=True)
+        fragment = parse_partial_json(answer)
+        if fragment:
+            accumulated.update(fragment)
+        structured = _structured()
+
+        # Refresh the tab that just completed; keep later tabs on their pending
+        # placeholders so the user can tell what's still being generated.
+        rendered["duck_questions"] = render_duck_questions(structured)
+        if key in ("repo_findings", "fix_options", "refactor"):
+            rendered["repo_findings"] = render_repo_findings(structured)
+        if key in ("fix_options", "refactor"):
+            rendered["fix_options"] = render_fix_options(structured)
+        if key == "refactor":
+            rendered["refactor"] = render_refactor(structured)
+
+        yield (
+            rendered["duck_questions"],
+            rendered["repo_findings"],
+            rendered["fix_options"],
+            rendered["refactor"],
+            _raw(structured),
+        )
+
 
 
 def continue_repo_conversation(repo: str, branch: str, destination: str, problem: str, followup: str,

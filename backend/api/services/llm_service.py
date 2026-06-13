@@ -52,6 +52,11 @@ class LLMService:
         self.default_max_new = config["LLM_MAX_NEW_TOKENS"]
         self.complex_max_new = config["LLM_COMPLEX_MAX_NEW_TOKENS"]
         self.default_temperature = config["LLM_TEMPERATURE"]
+        # Load the weights in 4-bit (bitsandbytes NF4) when requested. This
+        # roughly quarters VRAM and speeds up generation on a single GPU; it
+        # requires CUDA + bitsandbytes and is silently skipped on CPU.
+        self.load_in_4bit = bool(config.get("LLM_LOAD_IN_4BIT", False))
+
 
         self._model = None
         self._processor = None
@@ -68,9 +73,15 @@ class LLMService:
         bare ``AutoTokenizer`` (which carries Gemma 4's chat template) and a
         causal-LM head — no multimodal ``AutoProcessor`` is needed.
 
-        The model is always loaded with ``dtype="auto"`` /
-        ``device_map="auto"`` so accelerate handles layer placement and
-        precision automatically.
+        For speed we:
+          * load the weights in 4-bit (bitsandbytes NF4) when ``LLM_LOAD_IN_4BIT``
+            is set and CUDA is available — this quarters VRAM and is markedly
+            faster than fp32 on a single GPU; and
+          * otherwise pick an explicit half-precision dtype on GPU
+            (``float16``/``bfloat16``) instead of the checkpoint's native (often
+            fp32) precision, which is what made T4 inference slow.
+
+        ``device_map="auto"`` still lets accelerate place layers optimally.
         """
 
         if self._model is not None:
@@ -83,22 +94,89 @@ class LLMService:
 
             from transformers import AutoModelForCausalLM
 
-            log.info("Loading model '%s' (device_pref=%s) ...",
-                     self.model_id, self.device_pref)
+            log.info("Loading model '%s' (device_pref=%s, load_in_4bit=%s) ...",
+                     self.model_id, self.device_pref, self.load_in_4bit)
             t0 = time.time()
 
             self._processor = self._load_processor_or_tokenizer()
+
+            model_kwargs: dict = {"device_map": "auto"}
+            quant_config = self._build_quantization_config()
+            if quant_config is not None:
+                model_kwargs["quantization_config"] = quant_config
+            else:
+                # No quantization — at least pick an efficient dtype per device.
+                model_kwargs["dtype"] = self._resolve_dtype()
+
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
-                dtype="auto",       # let the model pick its native dtype
-                device_map="auto",  # let accelerate place layers optimally
+                **model_kwargs,
             )
 
             # Record the concrete device the model actually landed on so
             # callers (e.g. the UI status chip) can report it accurately.
             self.device = str(self._model.device)
-            log.info("Model loaded successfully in %.1fs (device=%s)",
-                     time.time() - t0, self.device)
+            log.info("Model loaded successfully in %.1fs (device=%s, quantized=%s)",
+                     time.time() - t0, self.device, quant_config is not None)
+
+    def _cuda_available(self) -> bool:
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    def _resolve_dtype(self):
+        """Pick an explicit dtype: half precision on GPU, ``auto`` on CPU.
+
+        On a T4 the checkpoint's native dtype is often fp32, which is the main
+        reason generation was slow. T4 has no bf16 support, so we use fp16
+        there and prefer bf16 only on GPUs that report support for it.
+        """
+        try:
+            import torch
+        except Exception:
+            return "auto"
+
+        if not torch.cuda.is_available():
+            return "auto"  # CPU: let the checkpoint decide (fp32 typically).
+        if getattr(torch.cuda, "is_bf16_supported", None) and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+
+    def _build_quantization_config(self):
+        """Return a bitsandbytes 4-bit config, or None if not applicable.
+
+        4-bit needs CUDA + bitsandbytes; on CPU (or if the dependency is
+        missing) we silently fall back to a normal half/auto-precision load so
+        the app keeps working everywhere.
+        """
+        if not self.load_in_4bit:
+            return None
+        if not self._cuda_available():
+            log.warning("LLM_LOAD_IN_4BIT set but CUDA is unavailable — "
+                        "loading without quantization.")
+            return None
+        try:
+            import torch
+            from transformers import BitsAndBytesConfig
+        except Exception as exc:  # noqa: BLE001
+            log.warning("4-bit quantization unavailable (%s) — "
+                        "loading without quantization.", exc)
+            return None
+
+        compute_dtype = (
+            torch.bfloat16
+            if getattr(torch.cuda, "is_bf16_supported", None) and torch.cuda.is_bf16_supported()
+            else torch.float16
+        )
+        return BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+
 
     def _load_processor_or_tokenizer(self):
         """Load a bare ``AutoTokenizer`` for **text-only** generation.
@@ -152,7 +230,7 @@ class LLMService:
     # ── Public generation methods ─────────────────────────────────────────────
 
     def generate_simple(self, query: str, max_new_tokens=None, temperature=None,
-                         use_context=True) -> dict:
+                         use_context=True, stop_on_json=False) -> dict:
         """
         Direct, fast answer — no extended reasoning.
 
@@ -162,6 +240,10 @@ class LLMService:
              retrieved and injected (skippable via use_context=False),
           3. the assembled prompt is run straight through the SLM,
           4. the answer + provenance is returned for the frontend.
+
+        When ``stop_on_json`` is True, generation halts as soon as the output
+        forms a complete balanced JSON object, so we don't burn tokens (and
+        wall-clock time) padding out to the full ``max_new_tokens`` budget.
         """
         from api.services.prompt_service import get_system_prompt
 
@@ -186,7 +268,9 @@ class LLMService:
             messages,
             max_new_tokens=max_new_tokens or self.default_max_new,
             temperature=temperature if temperature is not None else self.default_temperature,
+            stop_on_json=stop_on_json,
         )
+
         return {
             "answer": answer.strip(),
             "reasoning": None,
@@ -232,9 +316,10 @@ class LLMService:
         }
 
     # ── Internals ──────────────────────────────────────────────────────────────
-    def _chat(self, messages: list[dict], max_new_tokens: int, temperature: float) -> str:
-        log.info("Generating: input_tokens will be tokenized, max_new=%d, temp=%.3f",
-                 max_new_tokens, temperature)
+    def _chat(self, messages: list[dict], max_new_tokens: int, temperature: float,
+              stop_on_json: bool = False) -> str:
+        log.info("Generating: input_tokens will be tokenized, max_new=%d, temp=%.3f, "
+                 "stop_on_json=%s", max_new_tokens, temperature, stop_on_json)
         t0 = time.time()
 
         self.load()
@@ -266,11 +351,20 @@ class LLMService:
         if hasattr(inputs, "attention_mask"):
             generate_kwargs["attention_mask"] = inputs.attention_mask
 
+        # Stop as soon as a complete JSON object has been emitted so we don't
+        # waste tokens/time padding to the full budget (and so the answer is a
+        # complete, parseable object rather than a truncated one).
+        if stop_on_json:
+            criteria = self._json_stop_criteria(input_len)
+            if criteria is not None:
+                generate_kwargs["stopping_criteria"] = criteria
+
         with torch.no_grad():
             output_ids = self._model.generate(
                 input_ids,
                 **generate_kwargs,
             )
+
 
         # Only decode the newly generated tokens.
         generated = output_ids[0][input_len:]
@@ -284,6 +378,57 @@ class LLMService:
                  output_len / max(elapsed, 0.001))
         return decoded
 
+    def _json_stop_criteria(self, prompt_len: int):
+        """Build a ``StoppingCriteriaList`` that halts on a complete JSON object.
+
+        The criterion only does the (cheap) brace-balance scan when the most
+        recently generated token actually contains a ``}``, so it adds
+        negligible overhead per step. Returns ``None`` if the transformers
+        stopping-criteria API isn't importable, so generation still works.
+        """
+        try:
+            from transformers import StoppingCriteria, StoppingCriteriaList
+        except Exception:  # noqa: BLE001
+            return None
+
+        tokenizer = self._tokenizer
+
+        class _BalancedJSONStop(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):  # noqa: D401
+                last_id = int(input_ids[0, -1].item())
+                piece = tokenizer.decode([last_id], skip_special_tokens=True)
+                if "}" not in piece:
+                    return False
+                text = tokenizer.decode(input_ids[0][prompt_len:],
+                                        skip_special_tokens=True)
+                start = text.find("{")
+                if start < 0:
+                    return False
+                depth = 0
+                in_str = False
+                esc = False
+                for ch in text[start:]:
+                    if esc:
+                        esc = False
+                        continue
+                    if ch == "\\":
+                        esc = True
+                        continue
+                    if ch == '"':
+                        in_str = not in_str
+                        continue
+                    if in_str:
+                        continue
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            return True  # top-level object closed → stop.
+                return False
+
+        return StoppingCriteriaList([_BalancedJSONStop()])
+
     @staticmethod
     def _split_thinking(text: str) -> tuple[str | None, str]:
         """Separate a <think>...</think> reasoning trace from the final answer."""
@@ -292,6 +437,7 @@ class LLMService:
         if match:
             return match.group(1), match.group(2)
         return None, text
+
 
     def _retrieve_context(self, query: str) -> tuple[str, list[dict]]:
         """
