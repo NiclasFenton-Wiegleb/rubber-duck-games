@@ -68,7 +68,7 @@ def _detect_and_log_device(config) -> str:
         props = torch.cuda.get_device_properties(0)
         log.info("=" * 60)
         log.info("GPU DETECTED: %s (%.1f GiB VRAM)", props.name,
-                 props.total_mem / (1024 ** 3))
+                 props.total_memory / (1024 ** 3))
         log.info("Model will be loaded onto CUDA (GPU) with bfloat16 precision.")
         log.info("=" * 60)
     elif resolved == "mps":

@@ -98,7 +98,7 @@ def _configure_environment() -> str:
             if torch.cuda.is_available():
                 props = torch.cuda.get_device_properties(0)
                 log.info("GPU DETECTED: %s (%.1f GiB VRAM) — setting LLM_DEVICE=cuda",
-                         props.name, props.total_mem / (1024 ** 3))
+                         props.name, props.total_memory / (1024 ** 3))
                 os.environ["LLM_DEVICE"] = "cuda"
             elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
                 log.info("GPU DETECTED: Apple Metal (MPS) — setting LLM_DEVICE=mps")
