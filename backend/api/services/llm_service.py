@@ -17,7 +17,11 @@ Flask app can boot without them installed.
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
+
+log = logging.getLogger("llm_service")
 
 # Process-wide singleton so the multi-GB model is only loaded once.
 _INSTANCE: "LLMService | None" = None
@@ -57,14 +61,20 @@ class LLMService:
     def load(self):
         """Load tokenizer + model into memory (idempotent)."""
         if self._model is not None:
+            log.debug("Model already loaded, skipping load()")
             return
         with self._load_lock:
             if self._model is not None:
+                log.debug("Model already loaded (double-checked), skipping load()")
                 return
             import torch
             from transformers import AutoModelForCausalLM
 
             device = self._resolve_device(torch)
+            log.info("Loading model '%s' on device '%s' (pref=%s) ...",
+                     self.model_id, device, self.device_pref)
+            t0 = time.time()
+
             device_map = {"": device}
             dtype = self._dtype_for_device(torch, device)
 
@@ -77,6 +87,8 @@ class LLMService:
             # Record the concrete device the model actually landed on so callers
             # (e.g. the UI status chip) can report GPU vs. CPU accurately.
             self.device = device
+            log.info("Model loaded successfully in %.1fs (device=%s, dtype=%s)",
+                     time.time() - t0, device, dtype)
 
     def _resolve_device(self, torch) -> str:
         """Pick the best available local device for model inference.
@@ -228,6 +240,10 @@ class LLMService:
 
     # ── Internals ──────────────────────────────────────────────────────────────
     def _chat(self, messages: list[dict], max_new_tokens: int, temperature: float) -> str:
+        log.info("Generating: input_tokens will be tokenized, max_new=%d, temp=%.3f",
+                 max_new_tokens, temperature)
+        t0 = time.time()
+
         self.load()
         import torch
 
@@ -236,6 +252,10 @@ class LLMService:
             add_generation_prompt=True,
             return_tensors="pt",
         ).to(self._model.device)
+
+        input_len = inputs.shape[-1]
+        log.debug("Tokenized %d input tokens on device '%s'",
+                  input_len, self._model.device)
 
         with torch.no_grad():
             output_ids = self._model.generate(
@@ -249,7 +269,15 @@ class LLMService:
 
         # Only decode the newly generated tokens.
         generated = output_ids[0][inputs.shape[-1]:]
-        return self._tokenizer.decode(generated, skip_special_tokens=True)
+        output_len = len(generated)
+        decoded = self._tokenizer.decode(generated, skip_special_tokens=True)
+
+        elapsed = time.time() - t0
+        log.info("Generation done: input=%d tokens, output=%d tokens, "
+                 "elapsed=%.1fs (%.1f tok/s)",
+                 input_len, output_len, elapsed,
+                 output_len / max(elapsed, 0.001))
+        return decoded
 
     @staticmethod
     def _split_thinking(text: str) -> tuple[str | None, str]:

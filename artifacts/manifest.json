@@ -2,7 +2,7 @@
   "source_path": "test-repo",
   "total_chunks": 32,
   "total_nodes": 210,
-  "total_edges": 815,
+  "total_edges": 819,
   "embed_model": "BAAI/bge-small-en-v1.5",
   "embed_dim": 384,
   "chunk_size": 400,

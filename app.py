@@ -21,11 +21,6 @@ HuggingFace runs this file because README.md declares `sdk: gradio` and
 
 from __future__ import annotations
 
-# Import `spaces` FIRST — before torch is imported anywhere — so the ZeroGPU
-# runtime can patch torch's CUDA layer. On ZeroGPU there is no persistent GPU;
-# one is attached only while a @spaces.GPU-decorated function is executing.
-import spaces  # noqa: E402
-
 import importlib.util
 import html
 import json
@@ -36,6 +31,27 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
+    force=True,
+)
+log = logging.getLogger("space")
+
+# ── Optional HuggingFace ZeroGPU import ──────────────────────────────────────
+# On HuggingFace ZeroGPU, `spaces` must be imported FIRST — before torch — so
+# the runtime can patch torch's CUDA layer. When running locally, `spaces` is
+# not installed and we run model inference on the CPU (or local GPU) directly.
+try:
+    import spaces  # noqa: E402
+
+    _SPACES_AVAILABLE = True
+    log.info("spaces module imported — running on HuggingFace ZeroGPU")
+except ImportError:
+    _SPACES_AVAILABLE = False
+    log.info("spaces module not found — running in local mode (no ZeroGPU)")
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 ROOT_DIR = Path(__file__).resolve().parent
@@ -51,13 +67,6 @@ from api.services.structured_output import (  # noqa: E402
     render_refactor,
     render_repo_findings,
 )
-
-# ── Logging ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-)
-log = logging.getLogger("space")
 
 
 # ── Environment defaults (set BEFORE importing backend config) ───────────────
@@ -766,15 +775,20 @@ def backend_status() -> str:
     return f'<div class="status-icons">{"".join(chips)}</div>'
 
 
-# ── ZeroGPU duration / quota ─────────────────────────────────────────────────
-# `duration` is NOT "how long the GPU runs" — it is the amount of quota ZeroGPU
-# RESERVES UP FRONT for the call. Any unused portion is refunded when the call
-# returns, BUT if `duration` exceeds the quota you have left *right now*, the
-# call is rejected outright with:
-#     "exceeded your ZeroGPU quota (<duration>s requested vs. <remaining>s left)"
-# So we keep this modest (and tunable) instead of reserving a big block. The
-# first call still has to load the multi-GB model, so it needs more headroom
-# than later calls — hence a separate, larger first-load reservation.
+# ── Model inference ──────────────────────────────────────────────────────────
+# Two code paths for running the LLM:
+#
+#  **ZeroGPU** (HuggingFace Space): wrapped with @spaces.GPU so the ZeroGPU
+#    scheduler attaches a GPU for the duration of the call. The first call
+#    reserves a larger quota block (model load), subsequent calls use a small
+#    reservation so quota isn't wasted.
+#
+#  **Local** (CPU / local GPU): calls the LLM service directly with no decorator.
+#    This is the path taken when the `spaces` module is not installed.
+#
+# The reserved quota is computed by `_gpu_duration`: a larger block for the
+# first call (which downloads/loads the multi-GB model) and a small block for
+# every subsequent generation, so we don't needlessly exhaust the quota.
 GPU_DURATION = int(os.getenv("ZEROGPU_DURATION", "60"))
 GPU_LOAD_DURATION = int(os.getenv("ZEROGPU_LOAD_DURATION", "120"))
 
@@ -792,25 +806,16 @@ def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
     return GPU_DURATION
 
 
-@spaces.GPU(duration=_gpu_duration)
-def _generate_simple(message: str, use_context: bool, max_new_tokens: int,
-                     temperature: float) -> dict:
-    """Run one "simple request" generation on an on-demand ZeroGPU device.
-
-    This is the ONLY place the model touches CUDA. ZeroGPU attaches a GPU for
-    the duration of this call, so BOTH the first-time model load and every
-    generation must happen inside it — not in the background Flask thread, whose
-    separate call stack would NOT have a GPU attached. We therefore call the
-    in-process LLM service singleton directly here rather than going through the
-    internal Flask HTTP endpoint.
-
-    The reserved quota is computed by `_gpu_duration`: a larger block for the
-    first call (which downloads/loads the multi-GB model) and a small block for
-    every subsequent generation, so we don't needlessly exhaust the quota.
-    """
+def _run_generation(message: str, use_context: bool, max_new_tokens: int,
+                    temperature: float) -> dict:
+    """Core generation logic — called directly or wrapped by @spaces.GPU."""
     from api.services.llm_service import get_llm_service
 
+    log.info("Generation starting: message_len=%d, use_context=%s, "
+             "max_new_tokens=%d, temperature=%.2f",
+             len(message), use_context, max_new_tokens, temperature)
 
+    t0 = time.time()
     llm = get_llm_service(flask_app.config)
     result = llm.generate_simple(
         message,
@@ -818,24 +823,45 @@ def _generate_simple(message: str, use_context: bool, max_new_tokens: int,
         temperature=float(temperature),
         use_context=bool(use_context),
     )
-    # The device is only known after the (lazy) load runs inside this
-    # GPU-decorated call. Reflect the device the model actually landed on
-    # (e.g. "cpu" when no GPU was attached) so the UI status chip is accurate.
+    elapsed = time.time() - t0
+
+    # The device is only known after the (lazy) load runs. Reflect the device
+    # the model actually landed on (e.g. "cpu" when no GPU was attached) so the
+    # UI status chip is accurate.
     if llm.device:
         STATE["device"] = llm.device
+
+    answer_len = len(result.get("answer", ""))
+    sources_count = len(result.get("sources") or [])
+    log.info("Generation complete: elapsed=%.1fs, device=%s, answer_len=%d, "
+             "sources=%d, context_used=%s",
+             elapsed, llm.device, answer_len, sources_count,
+             result.get("context_used"))
+
     return result
 
 
+# ── Pick the right entry point depending on runtime ──────────────────────────
+if _SPACES_AVAILABLE:
+    _generate_simple = spaces.GPU(duration=_gpu_duration)(_run_generation)
+else:
+    _generate_simple = _run_generation
+
 
 def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float):
-    """Submit a prompt through the simple-request workstream (on ZeroGPU)."""
+    """Submit a prompt through the simple-request workstream."""
     message = (message or "").strip()
     if not message:
+        log.warning("ask() received empty message")
         return "Please enter a prompt.", "{}"
+
+    log.info("ask() called: message_len=%d, use_context=%s, max_new=%d, temp=%.2f",
+             len(message), use_context, max_new_tokens, temperature)
 
     try:
         result = _generate_simple(message, use_context, max_new_tokens, temperature)
     except Exception as exc:  # noqa: BLE001
+        log.exception("Generation failed: %s", exc)
         return f"⚠️ Generation failed: {exc}", json.dumps({"error": str(exc)}, indent=2)
 
     data = {"status": "ok", "mode": "simple", "query": message, **result}

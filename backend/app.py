@@ -15,6 +15,7 @@ or:
     flask --app app run --debug --port 5000
 """
 
+import logging
 from flask import Flask, jsonify
 from flask_cors import CORS
 
@@ -22,11 +23,24 @@ from config import Config
 from api.routes.knowledge_graph import kg_bp
 from api.routes.query import query_bp
 
+log = logging.getLogger("backend")
+
 
 def create_app(config_class: type = Config) -> Flask:
     """Application factory."""
     app = Flask(__name__)
     app.config.from_object(config_class)
+
+    # Configure Flask's logger to output request details for all HTTP methods.
+    app.logger.setLevel(logging.INFO)
+    if not app.logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s | %(message)s"
+        ))
+        app.logger.addHandler(handler)
+    # Also set the werkzeug logger level so POST requests are logged.
+    logging.getLogger("werkzeug").setLevel(logging.INFO)
 
     # Allow the local frontend (e.g. Vite/React dev server) to call these APIs.
     CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}})

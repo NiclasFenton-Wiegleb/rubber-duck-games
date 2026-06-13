@@ -28,8 +28,12 @@ empty context instead of crashing the request.
 from __future__ import annotations
 
 import json
+import logging
 import threading
+import time
 from pathlib import Path
+
+log = logging.getLogger("retrieval_service")
 
 # Process-wide singleton — the embedder + indexes are expensive to load.
 _INSTANCE: "RetrievalService | None" = None
@@ -86,15 +90,20 @@ class RetrievalService:
         top_k = top_k or self.top_k
         try:
             self._ensure_loaded()
-        except Exception:
+        except Exception as exc:
+            log.warning("Could not load retrieval indexes: %s", exc)
             return {"context": "", "sources": []}
 
         if not self._kgs:
+            log.debug("No knowledge graphs available for retrieval")
             return {"context": "", "sources": []}
 
         try:
+            t0 = time.time()
             q_emb = self._embed_query(query)
-        except Exception:
+            log.debug("Query embedding took %.3fs", time.time() - t0)
+        except Exception as exc:
+            log.warning("Could not embed query: %s", exc)
             return {"context": "", "sources": []}
 
         hits: list[dict] = []
