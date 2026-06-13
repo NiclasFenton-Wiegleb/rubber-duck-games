@@ -86,7 +86,7 @@ class Config:
 
     # ── Small Language Model ────────────────────────────────────────────────
     # The fine-tuned SmolLM3-3B produced by the notebook pipeline.
-    LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "niclasfw/smollm3-3b-codex")
+    LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "google/gemma-4-E4B-it")
     LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")  # auto | cpu | cuda | mps
     LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "512"))
     LLM_COMPLEX_MAX_NEW_TOKENS = int(os.getenv("LLM_COMPLEX_MAX_NEW_TOKENS", "2048"))
