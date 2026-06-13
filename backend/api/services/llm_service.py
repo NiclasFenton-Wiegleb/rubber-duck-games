@@ -16,8 +16,7 @@ it lazily on the first request. Transformers/torch are imported lazily so the
 Flask app can boot without them installed.
 
 To swap in a different model, set the ``LLM_MODEL_ID`` environment variable to
-any HuggingFace model id compatible with ``AutoModelForCausalLM`` and
-``AutoProcessor`` (e.g. ``LLM_MODEL_ID=niclasfw/smollm3-3b-codex``).
+any HuggingFace model id compatible with ``AutoModelForCausalLM``.
 """
 
 from __future__ import annotations
@@ -63,13 +62,16 @@ class LLMService:
 
     # ── Model loading ────────────────────────────────────────────────────────
     def load(self):
-        """Load processor + model into memory (idempotent).
+        """Load processor/tokenizer + model into memory (idempotent).
 
-        Uses ``AutoProcessor`` (required by Gemma 4 and other recent models
-        that ship a ``processor_config.json``) and loads the model with
-        ``dtype="auto"`` / ``device_map="auto"`` so accelerate handles
-        layer placement and precision automatically. This matches the
-        official model-card snippet for ``google/gemma-4-E4B-it``.
+        Tries ``AutoProcessor`` first (required by Gemma 4 on recent
+        ``transformers`` releases). Falls back to ``AutoTokenizer`` when
+        the installed ``transformers`` version doesn't know the model's
+        processing class yet (e.g. older HF Space runtimes).
+
+        The model is always loaded with ``dtype="auto"`` /
+        ``device_map="auto"`` so accelerate handles layer placement and
+        precision automatically.
         """
         if self._model is not None:
             log.debug("Model already loaded, skipping load()")
@@ -79,16 +81,13 @@ class LLMService:
                 log.debug("Model already loaded (double-checked), skipping load()")
                 return
 
-            from transformers import AutoModelForCausalLM, AutoProcessor
+            from transformers import AutoModelForCausalLM
 
             log.info("Loading model '%s' (device_pref=%s) ...",
                      self.model_id, self.device_pref)
             t0 = time.time()
 
-            # AutoProcessor handles tokenizer + image processor etc. for
-            # multi-modal models. For text-only generation we only need the
-            # `.tokenizer` attribute (exposed via the _tokenizer property).
-            self._processor = AutoProcessor.from_pretrained(self.model_id)
+            self._processor = self._load_processor_or_tokenizer()
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
                 dtype="auto",       # let the model pick its native dtype
@@ -101,16 +100,44 @@ class LLMService:
             log.info("Model loaded successfully in %.1fs (device=%s)",
                      time.time() - t0, self.device)
 
+    def _load_processor_or_tokenizer(self):
+        """Try ``AutoProcessor``; fall back to ``AutoTokenizer``.
+
+        On recent ``transformers`` releases Gemma 4 is recognised by
+        ``AutoProcessor``. On older releases (e.g. current HF Spaces)
+        the processor registry doesn't know the model yet, but the
+        checkpoint ships regular tokenizer files so ``AutoTokenizer``
+        works fine. For text-only generation the tokenizer is all we need.
+        """
+        from transformers import AutoProcessor, AutoTokenizer
+
+        try:
+            processor = AutoProcessor.from_pretrained(self.model_id)
+            log.info("Loaded processor via AutoProcessor")
+            return processor
+        except ValueError as exc:
+            if "Unrecognized processing class" not in str(exc):
+                raise
+            log.info(
+                "AutoProcessor not available for '%s' (older transformers?) — "
+                "falling back to AutoTokenizer.",
+                self.model_id,
+            )
+            tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+            log.info("Loaded tokenizer via AutoTokenizer")
+            return tokenizer
+
     @property
     def _tokenizer(self):
-        """Return the tokenizer backing the processor.
+        """Return the tokenizer.
 
-        ``AutoProcessor`` wraps a tokenizer (among other things like an
-        image processor). For text-only generation we only need the tokenizer.
+        When ``self._processor`` is an ``AutoProcessor`` instance the
+        tokenizer lives at ``.tokenizer``. When it's a bare tokenizer
+        (``AutoTokenizer`` fallback) we return it directly.
         """
         if self._processor is None:
             return None
-        return self._processor.tokenizer
+        return getattr(self._processor, "tokenizer", self._processor)
 
     @property
     def is_loaded(self) -> bool:
