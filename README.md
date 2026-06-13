@@ -4,9 +4,10 @@ emoji: 🦆
 colorFrom: yellow
 colorTo: green
 sdk: gradio
-sdk_version: 5.0.0
+sdk_version: 5.49.1
 python_version: "3.12"
 app_file: app.py
+
 pinned: false
 suggested_hardware: t4-small
 suggested_storage: small
