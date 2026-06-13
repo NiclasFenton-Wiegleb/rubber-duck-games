@@ -64,6 +64,16 @@ class Config:
 
     EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
     EMBED_BATCH = int(os.getenv("EMBED_BATCH", "64"))
+    # Device used to embed chunks when building a knowledge graph.
+    # IMPORTANT: the KG build runs inside the Flask backend thread, which on a
+    # HuggingFace ZeroGPU Space is *outside* any @spaces.GPU context. CUDA is
+    # only available inside that context, so creating a SentenceTransformer that
+    # auto-selects "cuda" here triggers a low-level CUDA init that ZeroGPU's
+    # emulation layer rejects. Default to CPU so the build always works; small
+    # chunk sets embed quickly on CPU. Override with EMBED_DEVICE=cuda only on a
+    # dedicated-GPU Space where CUDA is always attached.
+    EMBED_DEVICE = os.getenv("EMBED_DEVICE", "cpu")
+
 
     # ── Retrieval (multi-KG context for queries) ────────────────────────────
     # Root of the attached storage that holds one or more knowledge graphs,

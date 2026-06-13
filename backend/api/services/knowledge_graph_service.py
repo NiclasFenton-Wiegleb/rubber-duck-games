@@ -61,6 +61,11 @@ class KnowledgeGraphService:
         self.chunk_overlap = config["CHUNK_OVERLAP"]
         self.embed_model_name = config["EMBED_MODEL"]
         self.embed_batch = config["EMBED_BATCH"]
+        # Device used to embed chunks. Defaults to CPU because the KG build
+        # runs in the Flask thread, which on ZeroGPU is outside the
+        # @spaces.GPU context where CUDA is available.
+        self.embed_device = config.get("EMBED_DEVICE", "cpu")
+
 
     # ── Public entry point ──────────────────────────────────────────────────
     def build(self, source_path: str, kg_name: str = "default",
@@ -323,10 +328,17 @@ class KnowledgeGraphService:
         node_ids = [nid for nid, _ in chunk_nodes]
         texts = [f"passage: {d['text']}" for _, d in chunk_nodes]
 
-        embedder = SentenceTransformer(self.embed_model_name)
+        # Pin the embedder to an explicit device. On a ZeroGPU Space the KG
+        # build runs in the Flask thread (outside any @spaces.GPU context) where
+        # CUDA is unavailable; letting SentenceTransformer auto-select "cuda"
+        # there triggers a low-level CUDA init that ZeroGPU rejects. EMBED_DEVICE
+        # defaults to "cpu" for this reason (override on dedicated-GPU Spaces).
+        log.info("  → embedding on device=%s", self.embed_device)
+        embedder = SentenceTransformer(self.embed_model_name, device=self.embed_device)
         embeddings = embedder.encode(
             texts, batch_size=self.embed_batch, normalize_embeddings=True,
             convert_to_numpy=True, show_progress_bar=False,
+
         )
 
         dim = int(embeddings.shape[1])
