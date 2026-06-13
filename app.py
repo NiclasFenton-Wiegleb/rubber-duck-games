@@ -74,27 +74,48 @@ def _configure_environment() -> str:
     """Pick sensible Space defaults; honour anything already set in the env."""
     os.environ.setdefault("HOST", "127.0.0.1")
     os.environ.setdefault("PORT", "5000")
-    # CPU-only runtime: there is no GPU to manage, so eager-loading the model at
-    # startup is safe (it no longer risks initialising CUDA in the parent
-    # process). Disable lazy load so the weights are pulled into memory during
-    # warm-up, when the app launches, instead of on the first user query.
-    os.environ["LLM_LAZY_LOAD"] = "false"
     # Flask debug reloader must stay off inside a background thread.
     os.environ.setdefault("FLASK_DEBUG", "false")
-
 
     # Knowledge-graph storage: HF persistent storage is mounted at /data.
     if "KG_STORAGE_DIR" not in os.environ:
         default_storage = "/data" if Path("/data").exists() else str(BACKEND_DIR / "artifacts")
         os.environ["KG_STORAGE_DIR"] = default_storage
 
-    # CPU-only runtime: there is no GPU available, so pin the model device to
-    # "cpu". LLMService._resolve_device() honours this directly, and the model
-    # is eager-loaded onto the CPU during warm-up. (If this image is ever moved
-    # back onto a GPU instance, override LLM_DEVICE via the environment.)
-    os.environ.setdefault("LLM_DEVICE", "cpu")
+    # ── GPU detection at startup ──────────────────────────────────────────
+    # Probe the hardware and set LLM_DEVICE accordingly, so the backend loads
+    # the model onto the best available accelerator right from the start.
+    # On T4 / A10G / L4 instances torch.cuda.is_available() is True at boot.
+    # On ZeroGPU instances CUDA is only visible inside a @spaces.GPU context,
+    # so we fall back to "cpu" here and let the backend's _resolve_device()
+    # handle the fallback gracefully.
+    if "LLM_DEVICE" not in os.environ:
+        try:
+            import torch  # noqa: F811 (already imported above via spaces?)
+        except ImportError:
+            os.environ["LLM_DEVICE"] = "cpu"
+        else:
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                log.info("GPU DETECTED: %s (%.1f GiB VRAM) — setting LLM_DEVICE=cuda",
+                         props.name, props.total_mem / (1024 ** 3))
+                os.environ["LLM_DEVICE"] = "cuda"
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                log.info("GPU DETECTED: Apple Metal (MPS) — setting LLM_DEVICE=mps")
+                os.environ["LLM_DEVICE"] = "mps"
+            else:
+                log.info("No GPU detected — model will run on CPU.")
+                os.environ["LLM_DEVICE"] = "cpu"
 
-
+    # ── Lazy-load decision ───────────────────────────────────────────────
+    # On dedicated GPU instances (T4, A10G, etc.) the GPU is always attached,
+    # so we can eager-load the model at startup. On ZeroGPU, CUDA is only
+    # visible inside @spaces.GPU, so we defer loading to the first query
+    # (which runs inside the GPU context). Let the backend's own device
+    # detection handle the switch once inside the GPU context.
+    if "LLM_LAZY_LOAD" not in os.environ:
+        gpu_always_available = os.environ.get("LLM_DEVICE") == "cuda"
+        os.environ["LLM_LAZY_LOAD"] = "false" if gpu_always_available else "true"
 
     return os.environ["KG_STORAGE_DIR"]
 
@@ -136,13 +157,17 @@ def _run_backend():
 def _warmup():
     """Mount/verify storage, load the system prompt, the KG indexes and the model.
 
-    On this CPU-only runtime the model is eager-loaded here, at app launch, so
-    the weights are already resident in memory before the first user query. This
-    is safe because there is no GPU to manage (loading no longer risks
-    initialising CUDA in a context that breaks on-demand GPU allocation), so the
-    one-off load cost is paid up front rather than on the first query.
+    On dedicated GPU instances (T4, A10G, etc.) the GPU is always attached, so
+    the model is eager-loaded here at app launch so the weights are resident
+    before the first user query.
+
+    On ZeroGPU (where CUDA is only visible inside @spaces.GPU) we skip model
+    loading during warm-up — if we loaded here it would land on CPU and never
+    migrate to the GPU later. Instead the first query (which runs inside the GPU
+    context) triggers a lazy load onto CUDA.
     """
     cfg = flask_app.config
+    lazy_load = cfg.get("LLM_LAZY_LOAD", True)
     try:
         from api.services.llm_service import get_llm_service
         from api.services.prompt_service import get_system_prompt
@@ -158,12 +183,16 @@ def _warmup():
         STATE["kgs"] = retrieval.kg_names
         log.info("Warm-up: knowledge graphs found: %s", STATE["kgs"] or "(none)")
 
-        log.info("Warm-up: loading model into memory …")
-        llm = get_llm_service(cfg)
-        llm.load()
-        if llm.device:
-            STATE["device"] = llm.device
-        log.info("Warm-up: model loaded on device '%s'.", llm.device)
+        if not lazy_load:
+            log.info("Warm-up: loading model into memory …")
+            llm = get_llm_service(cfg)
+            llm.load()
+            if llm.device:
+                STATE["device"] = llm.device
+            log.info("Warm-up: model loaded on device '%s'.", llm.device)
+        else:
+            log.info("Warm-up: skipping model load (lazy-load mode — "
+                     "model will load on first query inside GPU context)")
 
         STATE["ready"] = True
     except Exception as exc:  # noqa: BLE001 - surface to the UI
