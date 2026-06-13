@@ -62,17 +62,17 @@ class LLMService:
 
     # ── Model loading ────────────────────────────────────────────────────────
     def load(self):
-        """Load processor/tokenizer + model into memory (idempotent).
+        """Load tokenizer + model into memory (idempotent).
 
-        Tries ``AutoProcessor`` first (required by Gemma 4 on recent
-        ``transformers`` releases). Falls back to ``AutoTokenizer`` when
-        the installed ``transformers`` version doesn't know the model's
-        processing class yet (e.g. older HF Space runtimes).
+        This service only does **text-to-text** generation, so we load a
+        bare ``AutoTokenizer`` (which carries Gemma 4's chat template) and a
+        causal-LM head — no multimodal ``AutoProcessor`` is needed.
 
         The model is always loaded with ``dtype="auto"`` /
         ``device_map="auto"`` so accelerate handles layer placement and
         precision automatically.
         """
+
         if self._model is not None:
             log.debug("Model already loaded, skipping load()")
             return
@@ -101,52 +101,36 @@ class LLMService:
                      time.time() - t0, self.device)
 
     def _load_processor_or_tokenizer(self):
-        """Try ``AutoProcessor``; fall back to ``AutoTokenizer``.
+        """Load a bare ``AutoTokenizer`` for **text-only** generation.
 
-        On recent ``transformers`` releases Gemma 4 is recognised by
-        ``AutoProcessor``. On older releases the processor registry
-        doesn't know the model yet; for some checkpoints a bare
-        ``AutoTokenizer`` is enough for text-only generation, so we
-        attempt that as a fallback.
+        This service only does text-to-text, so we deliberately avoid the
+        multimodal ``AutoProcessor``: Gemma 4's processor pulls in image /
+        audio processing classes that require optional heavy dependencies
+        (e.g. ``torchvision``), which would otherwise fail at import with
+        ``ModuleNotFoundError: No module named 'torchvision'``. The tokenizer
+        already carries the chat template we use via ``apply_chat_template``,
+        so it's all we need for text generation.
 
-        Gemma 4 (``google/gemma-4-E4B-it``) specifically requires
-        ``transformers >= 5.5.0``. On older versions ``AutoProcessor``
-        raises "Unrecognized processing class" and the ``AutoTokenizer``
-        fallback then crashes deep inside transformers with a cryptic
-        ``'list' object has no attribute 'keys'`` (the checkpoint's
-        ``extra_special_tokens`` are stored in the newer dict format).
-        We catch that case and re-raise with a clear, actionable message.
+        Requires ``transformers >= 5.5.0`` — older versions don't know
+        Gemma 4 and crash with ``'list' object has no attribute 'keys'``.
         """
         import transformers
-        from transformers import AutoProcessor, AutoTokenizer
-
-        try:
-            processor = AutoProcessor.from_pretrained(self.model_id)
-            log.info("Loaded processor via AutoProcessor")
-            return processor
-        except ValueError as exc:
-            if "Unrecognized processing class" not in str(exc):
-                raise
-            log.warning(
-                "AutoProcessor does not recognise '%s' with the installed "
-                "transformers %s — attempting AutoTokenizer fallback.",
-                self.model_id,
-                getattr(transformers, "__version__", "?"),
-            )
+        from transformers import AutoTokenizer
 
         try:
             tokenizer = AutoTokenizer.from_pretrained(self.model_id)
-            log.info("Loaded tokenizer via AutoTokenizer")
+            log.info("Loaded tokenizer via AutoTokenizer (text-only)")
             return tokenizer
         except AttributeError as exc:
             # Typical symptom of a too-old transformers for this checkpoint.
             raise RuntimeError(
-                f"Failed to load a processor/tokenizer for '{self.model_id}'. "
+                f"Failed to load a tokenizer for '{self.model_id}'. "
                 f"The installed transformers "
                 f"({getattr(transformers, '__version__', '?')}) is too old for "
                 f"this model — Gemma 4 requires transformers>=5.5.0. "
                 f"Please upgrade transformers (see requirements.txt)."
             ) from exc
+
 
 
     @property
