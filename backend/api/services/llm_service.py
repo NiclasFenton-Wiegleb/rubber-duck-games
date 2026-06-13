@@ -1,18 +1,23 @@
 """
-Small Language Model service.
+Language Model service.
 
-Loads the locally hosted, fine-tuned SmolLM3-3B model
-(`niclasfw/smollm3-3b-codex` by default) once and serves two kinds of output:
+Loads a HuggingFace chat model (configurable via LLM_MODEL_ID; defaults to
+``google/gemma-4-E4B-it``) as a process-wide singleton and serves two kinds of
+output:
 
   - generate_simple():  a direct, fast answer (no extended reasoning). Implements
                         the full "simple request" workstream: file-based system
-                        prompt + multi-KG context retrieval + SLM generation.
-  - generate_complex(): a richer answer using SmolLM3's "thinking" mode and,
+                        prompt + multi-KG context retrieval + LLM generation.
+  - generate_complex(): a richer answer with optional "thinking" mode and,
                         optionally, Knowledge-Graph / RAG context.
 
 The model is heavy, so we keep a process-wide singleton and (by default) load
 it lazily on the first request. Transformers/torch are imported lazily so the
 Flask app can boot without them installed.
+
+To swap in a different model, set the ``LLM_MODEL_ID`` environment variable to
+any HuggingFace model id compatible with ``AutoModelForCausalLM`` and
+``AutoTokenizer`` (e.g. ``LLM_MODEL_ID=niclasfw/smollm3-3b-codex``).
 """
 
 from __future__ import annotations
@@ -130,27 +135,152 @@ class LLMService:
         """
         Load the tokenizer for ``self.model_id``.
 
-        Some checkpoints (e.g. ones saved with a bleeding-edge / dev build of
-        ``transformers``) write ``"tokenizer_class": "TokenizersBackend"`` into
-        their ``tokenizer_config.json``. Older ``transformers`` releases don't
-        know that class, so ``AutoTokenizer`` raises::
+        Handles several known compatibility issues between checkpoint metadata
+        and the installed ``transformers`` version:
 
-            ValueError: Tokenizer class TokenizersBackend does not exist or is
-            not currently imported.
+        1. Some checkpoints (e.g. those saved with a bleeding-edge / dev build
+           of ``transformers``) write ``"tokenizer_class": "TokenizersBackend"``
+           into ``tokenizer_config.json``.  Older ``transformers`` releases
+           don't know that class, so ``AutoTokenizer`` raises::
 
-        We first try the normal ``AutoTokenizer`` path, then fall back to
-        loading the fast tokenizer directly from ``tokenizer.json`` (which
-        bypasses the ``tokenizer_class`` lookup entirely while still picking up
-        the chat template and special tokens from ``tokenizer_config.json``).
+               ValueError: Tokenizer class TokenizersBackend does not exist …
+
+        2. Gemma 4 (and similar recent checkpoints) ship a
+           ``tokenizer_config.json`` whose ``added_tokens_decoder`` key is an
+           **empty list** (``[]``) instead of an empty dict (``{}``).  Older
+           ``transformers`` versions fail inside
+           ``_set_model_specific_special_tokens`` with::
+
+               AttributeError: 'list' object has no attribute 'keys'
+
+        3. Some checkpoints store the chat template under ``chat_template``
+           (singular, as a string) while others use ``chat_templates``
+           (plural, as a dict).  We normalise to ``chat_template``.
+
+        Regardless of the error, we fall back to downloading and patching the
+        tokenizer config, then loading the fast tokenizer from the patched
+        config.
         """
         from transformers import AutoTokenizer
 
         try:
             return AutoTokenizer.from_pretrained(self.model_id)
-        except (ValueError, KeyError):
-            from transformers import PreTrainedTokenizerFast
+        except Exception:
+            log.warning(
+                "AutoTokenizer.from_pretrained failed for '%s' – "
+                "falling back to patched tokenizer config.",
+                self.model_id, exc_info=True,
+            )
+            return self._load_tokenizer_with_fixed_config()
 
-            return PreTrainedTokenizerFast.from_pretrained(self.model_id)
+    def _load_tokenizer_with_fixed_config(self):
+        """Download the tokenizer config, patch known incompatibilities,
+        and load a :class:`~transformers.PreTrainedTokenizerFast` from the
+        patched files."""
+        from pathlib import Path
+
+        from huggingface_hub import hf_hub_download, snapshot_download
+        from transformers import PreTrainedTokenizerFast
+
+        tmp_dir = None
+        try:
+            # Download all tokenizer files into a temporary directory so the
+            # fast tokenizer can find tokenizer.json, chat_template.jinja, etc.
+            log.info("Downloading tokenizer files for '%s' …", self.model_id)
+            tmp_dir = Path(snapshot_download(
+                self.model_id,
+                allow_patterns=[
+                    "tokenizer_config.json",
+                    "tokenizer.json",
+                    "special_tokens_map.json",
+                    "chat_template.jinja",
+                ],
+            ))
+
+            config_path = tmp_dir / "tokenizer_config.json"
+            if not config_path.exists():
+                # snapshot_download may have placed it elsewhere; try direct
+                config_path = Path(hf_hub_download(
+                    self.model_id, "tokenizer_config.json",
+                ))
+                tmp_dir = config_path.parent
+
+            self._patch_tokenizer_config(config_path)
+
+            log.info(
+                "Loading fast tokenizer from patched config at %s",
+                tmp_dir,
+            )
+            return PreTrainedTokenizerFast.from_pretrained(str(tmp_dir))
+
+        except Exception:
+            log.exception(
+                "Failed to load tokenizer for '%s' even with patched config.",
+                self.model_id,
+            )
+            raise
+
+    @staticmethod
+    def _patch_tokenizer_config(config_path):
+        """Patch known incompatibilities in ``tokenizer_config.json`` *in place*.
+
+        Patches applied:
+
+        * ``added_tokens_decoder``: if it is a list, convert to a dict (Gemma 4
+          ships an empty list, but transformers expects a dict).
+        * ``chat_template``: normalise to a string (some checkpoints use a
+          single-item dict or an array, which breaks the jinja renderer).
+        """
+        import json
+
+        with open(config_path, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+
+        patched = False
+
+        # ── added_tokens_decoder: list → dict ──────────────────────────
+        atd = cfg.get("added_tokens_decoder")
+        if isinstance(atd, list) and not isinstance(atd, dict):
+            # Convert list to dict keyed by token id (if items are dicts
+            # with an "id" field) or just use enumerated integer keys.
+            try:
+                new_atd = {}
+                for item in atd:
+                    tid = item["id"] if isinstance(item, dict) else len(new_atd)
+                    new_atd[tid] = item
+                cfg["added_tokens_decoder"] = new_atd
+                patched = True
+                log.info(
+                    "Patched added_tokens_decoder: list(%d) → dict(%d)",
+                    len(atd), len(new_atd),
+                )
+            except Exception:
+                # If conversion fails, replace with empty dict and let
+                # transformers handle missing entries gracefully.
+                cfg["added_tokens_decoder"] = {}
+                patched = True
+                log.warning("Patched added_tokens_decoder: list → {} (fallback)")
+
+        # ── chat_template: normalise to string ─────────────────────────
+        ct = cfg.get("chat_template")
+        if ct is not None and not isinstance(ct, str):
+            if isinstance(ct, dict) and len(ct) == 1:
+                cfg["chat_template"] = list(ct.values())[0]
+            elif isinstance(ct, list):
+                cfg["chat_template"] = ct[0] if ct else ""
+            else:
+                cfg["chat_template"] = str(ct)
+            patched = True
+            log.info("Patched chat_template: %s → str", type(ct).__name__)
+
+        if patched:
+            # Write the patched config back so PreTrainedTokenizerFast can
+            # read it from disk.
+            with open(config_path, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2, ensure_ascii=False)
+            log.info("Patched tokenizer_config.json written to %s", config_path)
+        else:
+            log.debug("tokenizer_config.json looks fine — no patches applied")
 
     @property
     def is_loaded(self) -> bool:
@@ -204,7 +334,7 @@ class LLMService:
     def generate_complex(self, query: str, use_context=True,
                          max_new_tokens=None, temperature=None) -> dict:
         """
-        Richer answer: enables SmolLM3 reasoning ("/think") and optionally
+        Richer answer: enables reasoning mode ("/think") and optionally
         injects Knowledge-Graph / RAG context. Splits out the model's
         <think>...</think> trace into a separate `reasoning` field.
         """

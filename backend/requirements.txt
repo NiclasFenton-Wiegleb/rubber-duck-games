@@ -19,8 +19,8 @@ huggingface_hub>=0.23,<1.0
 tqdm>=4.66
 
 # ── Local small language model ─────────────────────────────────
-torch>=2.2
-transformers>=4.44
+torch>=2.4
+transformers>=4.46
 accelerate>=0.30
 
 # ── HuggingFace ZeroGPU (on-demand GPU) ────────────────────────

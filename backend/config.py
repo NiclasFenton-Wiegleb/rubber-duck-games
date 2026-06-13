@@ -85,7 +85,8 @@ class Config:
     )
 
     # ── Small Language Model ────────────────────────────────────────────────
-    # The fine-tuned SmolLM3-3B produced by the notebook pipeline.
+    # Any HuggingFace model id compatible with AutoModelForCausalLM and
+    # AutoTokenizer.  Set via LLM_MODEL_ID env var.
     LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "google/gemma-4-E4B-it")
     LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")  # auto | cpu | cuda | mps
     LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "512"))
