@@ -26,6 +26,64 @@ from api.routes.query import query_bp
 log = logging.getLogger("backend")
 
 
+def _detect_and_log_device(config) -> str:
+    """
+    Detect the best available device for model inference at startup.
+
+    Returns the resolved device string ("cuda", "mps", or "cpu") and logs
+    a prominent message so operators can see at a glance where the model
+    will run.
+    """
+    try:
+        import torch
+    except ImportError:
+        log.info("PyTorch not installed – model inference will use CPU "
+                 "once torch becomes available.")
+        return "cpu"
+
+    device = (config.get("LLM_DEVICE") or "auto").lower()
+
+    cuda_available = torch.cuda.is_available()
+    mps_available = (
+        getattr(torch.backends, "mps", None)
+        and torch.backends.mps.is_available()
+    )
+
+    resolved: str
+    if device == "cuda":
+        resolved = "cuda" if cuda_available else "cpu"
+    elif device == "mps":
+        resolved = "mps" if mps_available else "cpu"
+    elif device == "cpu":
+        resolved = "cpu"
+    else:  # "auto" or anything unrecognised
+        if cuda_available:
+            resolved = "cuda"
+        elif mps_available:
+            resolved = "mps"
+        else:
+            resolved = "cpu"
+
+    if resolved == "cuda":
+        props = torch.cuda.get_device_properties(0)
+        log.info("=" * 60)
+        log.info("GPU DETECTED: %s (%.1f GiB VRAM)", props.name,
+                 props.total_mem / (1024 ** 3))
+        log.info("Model will be loaded onto CUDA (GPU) with bfloat16 precision.")
+        log.info("=" * 60)
+    elif resolved == "mps":
+        log.info("=" * 60)
+        log.info("GPU DETECTED: Apple Metal (MPS)")
+        log.info("Model will be loaded onto MPS with float16 precision.")
+        log.info("=" * 60)
+    else:
+        log.info("=" * 60)
+        log.info("NO GPU DETECTED — model will run on CPU (float32).")
+        log.info("=" * 60)
+
+    return resolved
+
+
 def create_app(config_class: type = Config) -> Flask:
     """Application factory."""
     app = Flask(__name__)
@@ -41,6 +99,18 @@ def create_app(config_class: type = Config) -> Flask:
         app.logger.addHandler(handler)
     # Also set the werkzeug logger level so POST requests are logged.
     logging.getLogger("werkzeug").setLevel(logging.INFO)
+
+    # ── GPU detection & early model loading ───────────────────────────────
+    _detect_and_log_device(app.config)
+
+    if not app.config.get("LLM_LAZY_LOAD", True):
+        log.info("LLM_LAZY_LOAD is false — pre-loading model at startup ...")
+        try:
+            from api.services.llm_service import get_llm_service
+            llm = get_llm_service(app.config)
+            log.info("Model pre-loaded successfully on device '%s'.", llm.device)
+        except Exception as exc:
+            log.error("Failed to pre-load model at startup: %s", exc)
 
     # Allow the local frontend (e.g. Vite/React dev server) to call these APIs.
     CORS(app, resources={r"/api/*": {"origins": app.config["CORS_ORIGINS"]}})
@@ -65,4 +135,5 @@ if __name__ == "__main__":
         host=app.config["HOST"],
         port=app.config["PORT"],
         debug=app.config["DEBUG"],
+        use_reloader=False,
     )
