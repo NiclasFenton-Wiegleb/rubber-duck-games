@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import glob
 import json
+import logging
 import os
 import pickle
 import re
+import time
 from collections import defaultdict
 from pathlib import Path
+
+log = logging.getLogger("kg_service")
 
 # File extensions we treat as ingestible text.
 TEXT_EXTENSIONS = {
@@ -59,22 +63,53 @@ class KnowledgeGraphService:
         self.embed_batch = config["EMBED_BATCH"]
 
     # ── Public entry point ──────────────────────────────────────────────────
-    def build(self, source_path: str, upload: bool = True) -> dict:
+    def build(self, source_path: str, kg_name: str = "default",
+              upload: bool = False) -> dict:
         src = Path(source_path)
         if not src.exists():
             raise FileNotFoundError(f"Source path does not exist: {source_path}")
 
+        self.kg_name = kg_name  # store for _write_manifest / _artifact_key_mapping
+        output_dir = self.out_dir / kg_name
+        log.info("=== Knowledge Graph build started ===")
+        log.info("  source_path : %s", src)
+        log.info("  kg_name     : %s", kg_name)
+        log.info("  output_dir  : %s", output_dir)
+        log.info("  upload      : %s", upload)
+        log.info("  embed_model : %s", self.embed_model_name)
+
         self._ensure_dirs()
 
+        t0 = time.time()
+        log.info("Step 1/4: Collecting chunks from source files …")
         chunks = self._collect_chunks(src)
         if not chunks:
             raise ValueError(f"No ingestible text files found under: {source_path}")
+        log.info("  → %d chunks collected in %.1fs", len(chunks), time.time() - t0)
 
         chunks_path = self._save_chunks(chunks)
+        log.info("  → chunks saved to %s", chunks_path)
+
+        t1 = time.time()
+        log.info("Step 2/4: Building NetworkX knowledge graph …")
         graph, entity_map, stats = self._build_graph(chunks)
+        log.info("  → graph built: %d nodes, %d edges in %.1fs",
+                 stats["nodes"], stats["edges"], time.time() - t1)
+
         kg_path, e2c_path = self._save_graph(graph, entity_map)
+        log.info("  → graph saved to %s", kg_path)
+
+        t2 = time.time()
+        log.info("Step 3/4: Building FAISS index (embedding %d chunks) …",
+                 stats["chunks"])
         faiss_path, node_map_path, embed_dim = self._build_faiss(graph)
+        log.info("  → FAISS index built: dim=%d in %.1fs",
+                 embed_dim, time.time() - t2)
+
+        t3 = time.time()
+        log.info("Step 4/4: Writing manifest …")
         manifest_path = self._write_manifest(stats, embed_dim, source_path)
+        log.info("  → manifest saved to %s", manifest_path)
 
         artifacts = {
             "manifest": str(manifest_path),
@@ -88,8 +123,22 @@ class KnowledgeGraphService:
         uploaded = []
         storage = None
         if upload:
+            log.info("Step 5/5: Uploading artifacts to HuggingFace …")
+            t_u = time.time()
             uploaded = self._upload(artifacts)
             storage = self._storage_info()
+            log.info("  → %d artifact(s) uploaded in %.1fs",
+                     len(uploaded), time.time() - t_u)
+
+        elapsed = time.time() - t0
+        log.info("=== Knowledge Graph build complete in %.1fs ===", elapsed)
+        log.info("  KG name     : %s", kg_name)
+        log.info("  Chunks      : %d", stats["chunks"])
+        log.info("  Nodes       : %d  (types: %s)",
+                 stats["nodes"], stats.get("node_types", {}))
+        log.info("  Edges       : %d", stats["edges"])
+        log.info("  Embed dim   : %d", embed_dim)
+        log.info("  Local dir   : %s", output_dir)
 
         result = {"stats": stats, "artifacts": artifacts, "uploaded": uploaded}
         if storage is not None:
@@ -153,7 +202,7 @@ class KnowledgeGraphService:
         return chunks
 
     def _save_chunks(self, chunks: list[dict]) -> Path:
-        path = self.out_dir / "chunks" / "chunks.jsonl"
+        path = self.out_dir / self.kg_name / "chunks" / "chunks.jsonl"
         with open(path, "w", encoding="utf-8") as f:
             for c in chunks:
                 f.write(json.dumps(c) + "\n")
@@ -254,10 +303,10 @@ class KnowledgeGraphService:
         return extract
 
     def _save_graph(self, graph, entity_map):
-        kg_path = self.out_dir / "kg" / "graph.pkl"
+        kg_path = self.out_dir / self.kg_name / "kg" / "graph.pkl"
         with open(kg_path, "wb") as f:
             pickle.dump(graph, f, protocol=pickle.HIGHEST_PROTOCOL)
-        e2c_path = self.out_dir / "kg" / "entity_to_chunks.json"
+        e2c_path = self.out_dir / self.kg_name / "kg" / "entity_to_chunks.json"
         with open(e2c_path, "w", encoding="utf-8") as f:
             json.dump(entity_map, f)
         return kg_path, e2c_path
@@ -285,9 +334,9 @@ class KnowledgeGraphService:
         ids = np.array([d["chunk_id"] for _, d in chunk_nodes], dtype=np.int64)
         index.add_with_ids(embeddings, ids)
 
-        faiss_path = self.out_dir / "faiss" / "index.faiss"
+        faiss_path = self.out_dir / self.kg_name / "faiss" / "index.faiss"
         faiss.write_index(index, str(faiss_path))
-        node_map_path = self.out_dir / "faiss" / "node_id_map.json"
+        node_map_path = self.out_dir / self.kg_name / "faiss" / "node_id_map.json"
         with open(node_map_path, "w", encoding="utf-8") as f:
             json.dump(node_ids, f)
         return faiss_path, node_map_path, dim
@@ -311,7 +360,7 @@ class KnowledgeGraphService:
                 "node_id_map": "data/repo-kg/faiss/node_id_map.json",
             },
         }
-        path = self.out_dir / "manifest.json"
+        path = self.out_dir / self.kg_name / "manifest.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         return path
@@ -403,4 +452,4 @@ class KnowledgeGraphService:
     # ── helpers ─────────────────────────────────────────────────────────────
     def _ensure_dirs(self):
         for sub in ("chunks", "kg", "faiss"):
-            (self.out_dir / sub).mkdir(parents=True, exist_ok=True)
+            (self.out_dir / self.kg_name / sub).mkdir(parents=True, exist_ok=True)

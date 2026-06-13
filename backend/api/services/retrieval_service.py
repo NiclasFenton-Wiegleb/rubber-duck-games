@@ -140,7 +140,10 @@ class RetrievalService:
         with self._load_lock:
             self._kgs = None
         self._ensure_loaded()
-        return len(self._kgs or [])
+        count = len(self._kgs or [])
+        log.info("Retrieval cache refreshed — %d KG(s) available: %s",
+                 count, self.kg_names)
+        return count
 
     @property
     def kg_names(self) -> list[str]:
@@ -173,23 +176,34 @@ class RetrievalService:
                 return
             import faiss  # lazy
 
+            kg_dirs = self._discover_kg_dirs()
+            log.info("Retrieval: discovered %d KG director(ies) in %s: %s",
+                     len(kg_dirs), self.storage_dir,
+                     [d.name for d in kg_dirs] if kg_dirs else "(none)")
+
             kgs: list[dict] = []
-            for kg_dir in self._discover_kg_dirs():
+            for kg_dir in kg_dirs:
                 index_path = kg_dir / "faiss" / "index.faiss"
                 chunks_path = kg_dir / "chunks" / "chunks.jsonl"
                 try:
                     index = faiss.read_index(str(index_path))
                     chunk_text = self._load_chunk_texts(chunks_path)
-                except Exception:
+                except Exception as exc:
+                    log.warning("Retrieval: failed to load KG '%s': %s",
+                                kg_dir.name, exc)
                     continue
                 if not chunk_text:
+                    log.warning("Retrieval: no chunks found for KG '%s'", kg_dir.name)
                     continue
                 kgs.append({
                     "name": kg_dir.name if kg_dir != self.storage_dir else "default",
                     "index": index,
                     "chunks": chunk_text,
                 })
+                log.info("Retrieval: loaded KG '%s' (%d chunks)",
+                         kgs[-1]["name"], len(chunk_text))
             self._kgs = kgs
+            log.info("Retrieval: %d KG(s) loaded into memory", len(kgs))
 
     def _discover_kg_dirs(self) -> list[Path]:
         """Find every KG folder under the storage root (subfolders or flat)."""

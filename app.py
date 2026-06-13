@@ -974,6 +974,78 @@ def clone_project(repo: str, branch: str, destination: str):
     return f"Cloned to `{dest}`."
 
 
+def _derived_kg_name(repo: str) -> str:
+    """Derive a knowledge-graph folder name from a repo URL or path."""
+    name = (repo or "").strip()
+    # Strip trailing .git and take the last path segment.
+    if name.endswith(".git"):
+        name = name[:-4]
+    # Take the last segment from a URL / path.
+    name = name.rstrip("/").rsplit("/", 1)[-1]
+    # Sanitise: keep only alphanumeric, dash, underscore.
+    import re as _re
+    name = _re.sub(r"[^a-zA-Z0-9_-]", "-", name).strip("-") or "repo-kg"
+    return name
+
+
+def clone_and_build_project(repo: str, branch: str, destination: str):
+    """Clone a repo, then automatically build its Knowledge Graph locally.
+
+    Returns (clone_status_text, kg_status_text).
+    """
+    # ── Step 1: Clone ───────────────────────────────────────────────────
+    clone_msg = clone_project(repo, branch, destination)
+    if "failed" in clone_msg.lower():
+        return clone_msg, f"KG build skipped — {clone_msg}"
+
+    dest = _resolve_destination(destination)
+    kg_name = _derived_kg_name(repo)
+    log.info("Auto-building KG for cloned repo. repo=%s, dest=%s, kg_name=%s",
+             repo[:80], dest, kg_name)
+
+    # ── Step 2: Trigger KG build via local backend API ──────────────────
+    try:
+        resp = requests.post(
+            f"{BACKEND_URL}/api/knowledge-graph/build",
+            json={"source_path": str(dest), "kg_name": kg_name, "upload": False},
+            timeout=60 * 60,  # KG builds can take a while
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            stats = data.get("stats", {})
+            chunks = stats.get("chunks", "?")
+            msg = (
+                f"Knowledge Graph built: **{kg_name}** "
+                f"({chunks} chunks, {stats.get('nodes', '?')} nodes, "
+                f"{stats.get('edges', '?')} edges)"
+            )
+            log.info("KG build succeeded: %s", msg)
+            # Update global STATE so the UI status chip reflects the new KG.
+            try:
+                retrieval = _get_retrieval_service()
+                retrieval.refresh()
+                STATE["kgs"] = retrieval.kg_names
+            except Exception:
+                pass
+            return clone_msg, msg
+        else:
+            err = resp.text[:500]
+            log.warning("KG build returned HTTP %d: %s", resp.status_code, err)
+            return clone_msg, f"KG build failed — HTTP {resp.status_code}: {err}"
+    except requests.exceptions.ConnectionError:
+        log.warning("KG build: backend not reachable at %s", BACKEND_URL)
+        return clone_msg, "KG build failed — backend not reachable."
+    except Exception as exc:  # noqa: BLE001
+        log.exception("KG build failed: %s", exc)
+        return clone_msg, f"KG build failed — {exc}"
+
+
+def _get_retrieval_service():
+    """Lazily import and return the retrieval service singleton."""
+    from api.services.retrieval_service import get_retrieval_service
+    return get_retrieval_service(flask_app.config)
+
+
 def _repo_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
     return "\n".join(
         [
@@ -1247,8 +1319,9 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
 
                 destination_input = gr.State("./runs/duck-repo-copy")
                 clone_status = gr.Markdown("")
+                kg_status = gr.Markdown("")
 
-                clone_button = gr.Button("Clone project", variant="primary", elem_classes=["primary-duck"])
+                clone_button = gr.Button("Clone Repo & Build KG", variant="primary", elem_classes=["primary-duck"])
 
                 with gr.Accordion("Model options", open=False):
                     use_context = gr.Checkbox(value=True, label="Use knowledge-graph context")
@@ -1304,9 +1377,9 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                         raw_json = gr.Code(value=PREVIEW_RAW_RESPONSE, label="JSON", language="json")
 
     clone_button.click(
-        clone_project,
+        clone_and_build_project,
         inputs=[repo_input, branch_input, destination_input],
-        outputs=clone_status,
+        outputs=[clone_status, kg_status],
     )
     fetch_branches_button.click(
         fetch_branches,
