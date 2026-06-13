@@ -84,9 +84,10 @@ class Config:
         "SYSTEM_PROMPT_PATH", str(BASE_DIR / "prompts" / "system_prompt.txt")
     )
 
-    # ── Small Language Model ────────────────────────────────────────────────
-    # Any HuggingFace model id compatible with AutoModelForCausalLM and
-    # AutoTokenizer.  Set via LLM_MODEL_ID env var.
+    # ── Language Model ──────────────────────────────────────────────────────
+    # Any HuggingFace model id compatible with AutoModelForCausalLM.
+    # Gemma 4 (and newer models) require AutoProcessor instead of AutoTokenizer.
+    # Set via LLM_MODEL_ID env var.
     LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "google/gemma-4-E4B-it")
     LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")  # auto | cpu | cuda | mps
     LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "512"))
