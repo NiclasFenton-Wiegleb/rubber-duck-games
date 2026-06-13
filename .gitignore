@@ -216,3 +216,26 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ── Project-generated artifacts (do NOT commit) ──────────────────────────────
+# Built knowledge-graph outputs and cloned repos are generated at runtime.
+# HuggingFace Spaces rejects binary files (e.g. graph.pkl, FAISS indexes) that
+# are not stored via Xet/LFS, so these must never be tracked in git.
+artifacts/
+backend/artifacts/
+runs/
+test-repo/
+
+# Binary model / index / pickle files
+*.pkl
+*.pickle
+*.faiss
+*.index
+*.bin
+*.pt
+*.pth
+*.npy
+*.npz
+*.safetensors
+
+

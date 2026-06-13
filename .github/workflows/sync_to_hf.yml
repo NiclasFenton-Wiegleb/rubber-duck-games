@@ -21,7 +21,26 @@ jobs:
         run: |
           git config --global credential.helper store
           echo "https://user:${HF_TOKEN}@huggingface.co" > ~/.git-credentials
+          git config --global user.email "github-actions@users.noreply.github.com"
+          git config --global user.name "github-actions"
+
+          # HuggingFace Spaces rejects binary files (e.g. graph.pkl, FAISS
+          # indexes) that aren't stored via Xet/LFS. Because we force-push, HF
+          # scans EVERY commit — so any binary that ever existed in history would
+          # keep the push rejected. To avoid that (without rewriting the GitHub
+          # history), we build a single, clean snapshot commit of the current
+          # tree on an orphan branch and push only that to the Space.
+          #
+          # `.gitignore` already excludes artifacts/, runs/ and binary patterns,
+          # but we also explicitly drop anything still tracked from older commits
+          # so the snapshot is guaranteed binary-free.
+          git checkout --orphan hf-sync
+          git reset
+          git rm -r --cached --ignore-unmatch artifacts backend/artifacts runs test-repo > /dev/null 2>&1 || true
+          git add -A
+          git commit -m "Sync to Hugging Face Space ($GITHUB_SHA)"
 
           git remote add space https://huggingface.co/spaces/niclasfw/rubber-duck-games
+          git push space hf-sync:main --force
 
-          git push space main --force
+
