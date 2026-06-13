@@ -87,37 +87,54 @@ def _configure_environment() -> str:
     # ── GPU detection at startup ──────────────────────────────────────────
     # Probe the hardware and set LLM_DEVICE accordingly, so the backend loads
     # the model onto the best available accelerator right from the start.
-    # On T4 / A10G / L4 instances torch.cuda.is_available() is True at boot.
-    # On ZeroGPU instances CUDA is only visible inside a @spaces.GPU context,
-    # so we fall back to "cpu" here and let the backend's _resolve_device()
-    # handle the fallback gracefully.
+    #
+    # IMPORTANT — ZeroGPU: on a ZeroGPU Space the `spaces` runtime patches
+    # torch so that `torch.cuda.is_available()` reports True even in the main
+    # process, but the *real* GPU is only attached inside a forked
+    # @spaces.GPU worker. If we probe `torch.cuda` (or, worse, load the model)
+    # in the main process we initialize a CUDA context in the parent, which is
+    # incompatible with the fork-based ZeroGPU worker and makes the worker's
+    # `torch.init(nvidia_uuid)` fail with "No CUDA GPUs are available".
+    # So on ZeroGPU we must NOT touch torch.cuda here — we simply declare the
+    # device as "cuda" and defer all GPU work to the @spaces.GPU context.
     if "LLM_DEVICE" not in os.environ:
-        try:
-            import torch  # noqa: F811 (already imported above via spaces?)
-        except ImportError:
-            os.environ["LLM_DEVICE"] = "cpu"
+        if _SPACES_AVAILABLE:
+            log.info("ZeroGPU runtime detected — deferring all CUDA use to the "
+                     "@spaces.GPU context; setting LLM_DEVICE=cuda (not probing "
+                     "torch.cuda in the main process).")
+            os.environ["LLM_DEVICE"] = "cuda"
         else:
-            if torch.cuda.is_available():
-                props = torch.cuda.get_device_properties(0)
-                log.info("GPU DETECTED: %s (%.1f GiB VRAM) — setting LLM_DEVICE=cuda",
-                         props.name, props.total_memory / (1024 ** 3))
-                os.environ["LLM_DEVICE"] = "cuda"
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                log.info("GPU DETECTED: Apple Metal (MPS) — setting LLM_DEVICE=mps")
-                os.environ["LLM_DEVICE"] = "mps"
-            else:
-                log.info("No GPU detected — model will run on CPU.")
+            try:
+                import torch  # noqa: F811 (already imported above via spaces?)
+            except ImportError:
                 os.environ["LLM_DEVICE"] = "cpu"
+            else:
+                if torch.cuda.is_available():
+                    props = torch.cuda.get_device_properties(0)
+                    log.info("GPU DETECTED: %s (%.1f GiB VRAM) — setting LLM_DEVICE=cuda",
+                             props.name, props.total_memory / (1024 ** 3))
+                    os.environ["LLM_DEVICE"] = "cuda"
+                elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                    log.info("GPU DETECTED: Apple Metal (MPS) — setting LLM_DEVICE=mps")
+                    os.environ["LLM_DEVICE"] = "mps"
+                else:
+                    log.info("No GPU detected — model will run on CPU.")
+                    os.environ["LLM_DEVICE"] = "cpu"
 
     # ── Lazy-load decision ───────────────────────────────────────────────
     # On dedicated GPU instances (T4, A10G, etc.) the GPU is always attached,
     # so we can eager-load the model at startup. On ZeroGPU, CUDA is only
-    # visible inside @spaces.GPU, so we defer loading to the first query
-    # (which runs inside the GPU context). Let the backend's own device
-    # detection handle the switch once inside the GPU context.
+    # visible inside @spaces.GPU, so we MUST defer loading to the first query
+    # (which runs inside the GPU context). Eager-loading on ZeroGPU would
+    # initialize a CUDA context in the main process and break the forked
+    # GPU worker, so lazy-load is forced on whenever `spaces` is available.
     if "LLM_LAZY_LOAD" not in os.environ:
-        gpu_always_available = os.environ.get("LLM_DEVICE") == "cuda"
-        os.environ["LLM_LAZY_LOAD"] = "false" if gpu_always_available else "true"
+        if _SPACES_AVAILABLE:
+            os.environ["LLM_LAZY_LOAD"] = "true"
+        else:
+            gpu_always_available = os.environ.get("LLM_DEVICE") == "cuda"
+            os.environ["LLM_LAZY_LOAD"] = "false" if gpu_always_available else "true"
+
 
     return os.environ["KG_STORAGE_DIR"]
 
