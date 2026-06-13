@@ -88,20 +88,19 @@ def _configure_environment() -> str:
     # Probe the hardware and set LLM_DEVICE accordingly, so the backend loads
     # the model onto the best available accelerator right from the start.
     #
-    # IMPORTANT — ZeroGPU: on a ZeroGPU Space the `spaces` runtime patches
-    # torch so that `torch.cuda.is_available()` reports True even in the main
-    # process, but the *real* GPU is only attached inside a forked
-    # @spaces.GPU worker. If we probe `torch.cuda` (or, worse, load the model)
-    # in the main process we initialize a CUDA context in the parent, which is
-    # incompatible with the fork-based ZeroGPU worker and makes the worker's
-    # `torch.init(nvidia_uuid)` fail with "No CUDA GPUs are available".
-    # So on ZeroGPU we must NOT touch torch.cuda here — we simply declare the
-    # device as "cuda" and defer all GPU work to the @spaces.GPU context.
+    # ZeroGPU note: on a ZeroGPU Space the `spaces` runtime enables a torch
+    # "CUDA emulation" mode in the main process. The *recommended* pattern is to
+    # place the model on `cuda` at startup (module level) — the emulation packs
+    # the weights so each forked @spaces.GPU worker can restore them quickly.
+    # We therefore declare the device as "cuda" on ZeroGPU, but we must NOT call
+    # `torch.cuda.get_device_properties()` / other manual probes here: those
+    # force a *real* CUDA init in the main process, which is unnecessary (the
+    # emulation already handles the load) and can interfere with the worker.
     if "LLM_DEVICE" not in os.environ:
         if _SPACES_AVAILABLE:
-            log.info("ZeroGPU runtime detected — deferring all CUDA use to the "
-                     "@spaces.GPU context; setting LLM_DEVICE=cuda (not probing "
-                     "torch.cuda in the main process).")
+            log.info("ZeroGPU runtime detected — setting LLM_DEVICE=cuda; the "
+                     "model is eager-loaded at startup and packed by the spaces "
+                     "CUDA-emulation layer (no manual torch.cuda probing).")
             os.environ["LLM_DEVICE"] = "cuda"
         else:
             try:
@@ -122,18 +121,19 @@ def _configure_environment() -> str:
                     os.environ["LLM_DEVICE"] = "cpu"
 
     # ── Lazy-load decision ───────────────────────────────────────────────
-    # On dedicated GPU instances (T4, A10G, etc.) the GPU is always attached,
-    # so we can eager-load the model at startup. On ZeroGPU, CUDA is only
-    # visible inside @spaces.GPU, so we MUST defer loading to the first query
-    # (which runs inside the GPU context). Eager-loading on ZeroGPU would
-    # initialize a CUDA context in the main process and break the forked
-    # GPU worker, so lazy-load is forced on whenever `spaces` is available.
+    # Eager-load the model at startup whenever a GPU is the target device:
+    #   * Dedicated GPU instances (T4, A10G, L4): the GPU is always attached,
+    #     so eager-loading means the weights are resident before the first query.
+    #   * ZeroGPU: HuggingFace explicitly recommends placing the model on `cuda`
+    #     at startup so the emulation layer can pack the weights ahead of time.
+    #     This keeps the model "warm" — the first @spaces.GPU request restores
+    #     packed tensors quickly instead of loading the multi-GB model on demand
+    #     (lazy-loading inside @spaces.GPU is discouraged and far less efficient).
+    # Only fall back to lazy-loading on CPU/MPS-only runtimes.
     if "LLM_LAZY_LOAD" not in os.environ:
-        if _SPACES_AVAILABLE:
-            os.environ["LLM_LAZY_LOAD"] = "true"
-        else:
-            gpu_always_available = os.environ.get("LLM_DEVICE") == "cuda"
-            os.environ["LLM_LAZY_LOAD"] = "false" if gpu_always_available else "true"
+        gpu_target = _SPACES_AVAILABLE or os.environ.get("LLM_DEVICE") == "cuda"
+        os.environ["LLM_LAZY_LOAD"] = "false" if gpu_target else "true"
+
 
 
     return os.environ["KG_STORAGE_DIR"]
@@ -176,15 +176,20 @@ def _run_backend():
 def _warmup():
     """Mount/verify storage, load the system prompt, the KG indexes and the model.
 
-    On dedicated GPU instances (T4, A10G, etc.) the GPU is always attached, so
-    the model is eager-loaded here at app launch so the weights are resident
-    before the first user query.
+    The model is eager-loaded at launch (``LLM_LAZY_LOAD`` is false) on every
+    GPU-targeted runtime:
 
-    On ZeroGPU (where CUDA is only visible inside @spaces.GPU) we skip model
-    loading during warm-up — if we loaded here it would land on CPU and never
-    migrate to the GPU later. Instead the first query (which runs inside the GPU
-    context) triggers a lazy load onto CUDA.
+      * Dedicated GPU instances (T4, A10G, L4): the GPU is always attached, so
+        eager-loading leaves the weights resident before the first user query.
+      * ZeroGPU: HuggingFace recommends placing the model on ``cuda`` at startup
+        so the spaces CUDA-emulation layer can pack the weights ahead of time —
+        each forked @spaces.GPU worker then restores them quickly, keeping the
+        first request fast. (The model load happens in the main process, which
+        is exactly where the emulation can capture/pack it.)
+
+    Only CPU/MPS-only runtimes fall back to lazy-loading.
     """
+
     cfg = flask_app.config
     lazy_load = cfg.get("LLM_LAZY_LOAD", True)
     try:
