@@ -48,6 +48,10 @@ class LLMService:
         self._model = None
         self._tokenizer = None
         self._load_lock = threading.Lock()
+        # Resolved at load() time — the concrete device the model actually
+        # ended up on (e.g. "cuda" pref may resolve to "cpu" with no GPU).
+        self.device: str | None = None
+
 
     # ── Model loading ────────────────────────────────────────────────────────
     def load(self):
@@ -70,16 +74,37 @@ class LLMService:
                 torch_dtype=dtype,
                 device_map=device_map,
             )
+            # Record the concrete device the model actually landed on so callers
+            # (e.g. the UI status chip) can report GPU vs. CPU accurately.
+            self.device = device
 
     def _resolve_device(self, torch) -> str:
-        """Pick the best available local device for model inference."""
-        if self.device_pref in ("cpu", "cuda", "mps"):
-            return self.device_pref
+        """Pick the best available local device for model inference.
+
+        An explicit preference is honoured *only if that accelerator is
+        actually usable*. In particular a pinned ``"cuda"`` preference — which
+        the ZeroGPU entry point sets unconditionally because a GPU is only
+        attached inside a ``@spaces.GPU`` call — gracefully falls back to CPU
+        when no GPU is present. This lets the same image run on both GPU and
+        CPU-only instances without crashing on model load.
+        """
+        pref = (self.device_pref or "auto").lower()
+
+        if pref == "cuda":
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        if pref == "mps":
+            mps = getattr(torch.backends, "mps", None)
+            return "mps" if mps and mps.is_available() else "cpu"
+        if pref == "cpu":
+            return "cpu"
+
+        # "auto" (or anything unrecognised): pick the best available device.
         if torch.cuda.is_available():
             return "cuda"
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             return "mps"
         return "cpu"
+
 
     @staticmethod
     def _dtype_for_device(torch, device: str):

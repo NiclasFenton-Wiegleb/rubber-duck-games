@@ -79,11 +79,17 @@ def _configure_environment() -> str:
         os.environ["KG_STORAGE_DIR"] = default_storage
 
     # ZeroGPU: a CUDA device is only visible *inside* a @spaces.GPU function, so
-    # torch.cuda.is_available() is False at startup. Pin the device to "cuda"
-    # unconditionally — the model is loaded and run within the GPU-decorated
-    # path (_generate_simple), where the device is actually attached. We avoid
+    # torch.cuda.is_available() is False at startup. Pin the *preference* to
+    # "cuda" — the model is loaded and run within the GPU-decorated path
+    # (_generate_simple), where the device is actually attached. We avoid
     # importing torch / probing CUDA here to keep the parent process CUDA-clean.
+    #
+    # This is only a preference: LLMService._resolve_device() re-checks GPU
+    # availability at load time (inside the GPU-decorated call) and transparently
+    # falls back to CPU when no GPU is present, so the same image runs on both
+    # GPU and CPU-only instances.
     os.environ.setdefault("LLM_DEVICE", "cuda")
+
 
     return os.environ["KG_STORAGE_DIR"]
 
@@ -802,12 +808,19 @@ def _generate_simple(message: str, use_context: bool, max_new_tokens: int,
 
 
     llm = get_llm_service(flask_app.config)
-    return llm.generate_simple(
+    result = llm.generate_simple(
         message,
         max_new_tokens=int(max_new_tokens),
         temperature=float(temperature),
         use_context=bool(use_context),
     )
+    # The device is only known after the (lazy) load runs inside this
+    # GPU-decorated call. Reflect the device the model actually landed on
+    # (e.g. "cpu" when no GPU was attached) so the UI status chip is accurate.
+    if llm.device:
+        STATE["device"] = llm.device
+    return result
+
 
 
 def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float):
