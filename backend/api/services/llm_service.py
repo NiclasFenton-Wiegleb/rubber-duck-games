@@ -104,11 +104,20 @@ class LLMService:
         """Try ``AutoProcessor``; fall back to ``AutoTokenizer``.
 
         On recent ``transformers`` releases Gemma 4 is recognised by
-        ``AutoProcessor``. On older releases (e.g. current HF Spaces)
-        the processor registry doesn't know the model yet, but the
-        checkpoint ships regular tokenizer files so ``AutoTokenizer``
-        works fine. For text-only generation the tokenizer is all we need.
+        ``AutoProcessor``. On older releases the processor registry
+        doesn't know the model yet; for some checkpoints a bare
+        ``AutoTokenizer`` is enough for text-only generation, so we
+        attempt that as a fallback.
+
+        Gemma 4 (``google/gemma-4-E4B-it``) specifically requires
+        ``transformers >= 5.5.0``. On older versions ``AutoProcessor``
+        raises "Unrecognized processing class" and the ``AutoTokenizer``
+        fallback then crashes deep inside transformers with a cryptic
+        ``'list' object has no attribute 'keys'`` (the checkpoint's
+        ``extra_special_tokens`` are stored in the newer dict format).
+        We catch that case and re-raise with a clear, actionable message.
         """
+        import transformers
         from transformers import AutoProcessor, AutoTokenizer
 
         try:
@@ -118,14 +127,27 @@ class LLMService:
         except ValueError as exc:
             if "Unrecognized processing class" not in str(exc):
                 raise
-            log.info(
-                "AutoProcessor not available for '%s' (older transformers?) — "
-                "falling back to AutoTokenizer.",
+            log.warning(
+                "AutoProcessor does not recognise '%s' with the installed "
+                "transformers %s — attempting AutoTokenizer fallback.",
                 self.model_id,
+                getattr(transformers, "__version__", "?"),
             )
+
+        try:
             tokenizer = AutoTokenizer.from_pretrained(self.model_id)
             log.info("Loaded tokenizer via AutoTokenizer")
             return tokenizer
+        except AttributeError as exc:
+            # Typical symptom of a too-old transformers for this checkpoint.
+            raise RuntimeError(
+                f"Failed to load a processor/tokenizer for '{self.model_id}'. "
+                f"The installed transformers "
+                f"({getattr(transformers, '__version__', '?')}) is too old for "
+                f"this model — Gemma 4 requires transformers>=5.5.0. "
+                f"Please upgrade transformers (see requirements.txt)."
+            ) from exc
+
 
     @property
     def _tokenizer(self):

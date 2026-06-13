@@ -20,8 +20,13 @@ tqdm>=4.66
 
 # ── Local small language model ─────────────────────────────────
 torch>=2.4
-transformers>=4.46
+# Gemma 4 (google/gemma-4-E4B-it) is only recognised by AutoProcessor from
+# transformers >= 5.5.0. Older versions fail with "Unrecognized processing
+# class" and then crash in the AutoTokenizer fallback
+# ("'list' object has no attribute 'keys'").
+transformers>=5.5.0
 accelerate>=0.30
+
 
 # ── HuggingFace ZeroGPU (on-demand GPU) ────────────────────────
 # Provides the @spaces.GPU decorator used by the Space entry point (app.py).
