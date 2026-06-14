@@ -18,6 +18,7 @@ or:
 import logging
 from flask import Flask, jsonify
 from flask_cors import CORS
+import os
 
 from config import Config
 from api.routes.knowledge_graph import kg_bp
