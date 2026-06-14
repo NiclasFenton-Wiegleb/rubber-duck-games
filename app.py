@@ -85,18 +85,7 @@ def _configure_environment() -> str:
         os.environ["KG_STORAGE_DIR"] = default_storage
 
     # ── GPU detection at startup ──────────────────────────────────────────
-    # Probe the hardware and set LLM_DEVICE accordingly, so the backend loads
-    # the model onto the best available accelerator right from the start.
-    #
-<<<<<<< HEAD
-    # ZeroGPU note: on a ZeroGPU Space the `spaces` runtime enables a torch
-    # "CUDA emulation" mode in the main process. The *recommended* pattern is to
-    # place the model on `cuda` at startup (module level) — the emulation packs
-    # the weights so each forked @spaces.GPU worker can restore them quickly.
-    # We therefore declare the device as "cuda" on ZeroGPU, but we must NOT call
-    # `torch.cuda.get_device_properties()` / other manual probes here: those
-    # force a *real* CUDA init in the main process, which is unnecessary (the
-    # emulation already handles the load) and can interfere with the worker.
+
     if "LLM_DEVICE" not in os.environ:
         if _SPACES_AVAILABLE:
             log.info("ZeroGPU runtime detected — setting LLM_DEVICE=cuda; the "
@@ -106,30 +95,6 @@ def _configure_environment() -> str:
         else:
             try:
                 import torch  # noqa: F811 (already imported above via spaces?)
-=======
-    # ‼️ IMPORTANT: On HuggingFace ZeroGPU the ``spaces`` module patches
-    # ``torch.cuda.is_available()`` to return True in the host process, but
-    # CUDA is only real inside a ``@spaces.GPU``-decorated worker. Probing
-    # CUDA here and acting on the result (eager-loading the model) creates a
-    # CUDA context in the host that poisons ZeroGPU's fork-based workers,
-    # causing every generation request to fail with:
-    #     RuntimeError: No CUDA GPUs are available
-    # So we detect ZeroGPU FIRST and skip all torch probing.
-    if "LLM_DEVICE" not in os.environ:
-        is_zero_gpu = os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true", "yes")
-        if is_zero_gpu:
-            # ZeroGPU: CUDA is real only inside @spaces.GPU workers. Set
-            # "cuda" so _resolve_dtype picks bf16 for the model weights, but
-            # do NOT probe torch.cuda here — the patched probe lies and
-            # acting on it breaks the fork worker.
-            log.info("ZeroGPU runtime detected — setting LLM_DEVICE=cuda; "
-                     "the model is lazy-loaded inside the GPU context where "
-                     "CUDA is real (host-process probing skipped).")
-            os.environ["LLM_DEVICE"] = "cuda"
-        else:
-            try:
-                import torch  # noqa: F811
->>>>>>> backend
             except ImportError:
                 os.environ["LLM_DEVICE"] = "cpu"
             else:
@@ -146,37 +111,12 @@ def _configure_environment() -> str:
                     os.environ["LLM_DEVICE"] = "cpu"
 
     # ── Lazy-load decision ───────────────────────────────────────────────
-<<<<<<< HEAD
-    # Eager-load the model at startup whenever a GPU is the target device:
-    #   * Dedicated GPU instances (T4, A10G, L4): the GPU is always attached,
-    #     so eager-loading means the weights are resident before the first query.
-    #   * ZeroGPU: HuggingFace explicitly recommends placing the model on `cuda`
-    #     at startup so the emulation layer can pack the weights ahead of time.
-    #     This keeps the model "warm" — the first @spaces.GPU request restores
-    #     packed tensors quickly instead of loading the multi-GB model on demand
-    #     (lazy-loading inside @spaces.GPU is discouraged and far less efficient).
-    # Only fall back to lazy-loading on CPU/MPS-only runtimes.
+
     if "LLM_LAZY_LOAD" not in os.environ:
         gpu_target = _SPACES_AVAILABLE or os.environ.get("LLM_DEVICE") == "cuda"
         os.environ["LLM_LAZY_LOAD"] = "false" if gpu_target else "true"
 
 
-=======
-    # On dedicated GPU instances (T4, A10G, etc.) the GPU is always attached,
-    # so we can eager-load the model at startup. On ZeroGPU, CUDA is only real
-    # inside @spaces.GPU workers, so we ALWAYS lazy-load — loading in the host
-    # process creates a CUDA context that poisons the fork-based worker,
-    # causing ``RuntimeError: No CUDA GPUs are available`` on every query.
-    if "LLM_LAZY_LOAD" not in os.environ:
-        is_zero_gpu = os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true", "yes")
-        if is_zero_gpu:
-            os.environ["LLM_LAZY_LOAD"] = "true"
-            log.info("ZeroGPU: lazy-load forced to prevent host CUDA "
-                     "context from poisoning fork workers.")
-        else:
-            gpu_always_available = os.environ.get("LLM_DEVICE") == "cuda"
-            os.environ["LLM_LAZY_LOAD"] = "false" if gpu_always_available else "true"
->>>>>>> backend
 
     return os.environ["KG_STORAGE_DIR"]
 
