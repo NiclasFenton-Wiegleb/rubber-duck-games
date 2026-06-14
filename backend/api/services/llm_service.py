@@ -82,8 +82,16 @@ class LLMService:
             (``float16``/``bfloat16``) instead of the checkpoint's native (often
             fp32) precision, which is what made T4 inference slow.
 
-        ``device_map="auto"`` still lets accelerate place layers optimally.
+        Device placement is runtime-aware:
+          * Off ZeroGPU we pass ``device_map="auto"`` so accelerate places
+            layers optimally across the available device(s).
+          * On ZeroGPU we deliberately avoid ``device_map="auto"`` (it makes
+            accelerate probe the real GPU and initialise a CUDA context in the
+            host process, which poisons the forked ``@spaces.GPU`` worker).
+            Instead we load on CPU and call the ``spaces``-patched ``.to("cuda")``
+            so the weights are packed at startup with no real CUDA init.
         """
+
 
         if self._model is not None:
             log.debug("Model already loaded, skipping load()")
@@ -101,7 +109,9 @@ class LLMService:
 
             self._processor = self._load_processor_or_tokenizer()
 
-            model_kwargs: dict = {"device_map": "auto"}
+            on_zero_gpu = self._on_zero_gpu()
+
+            model_kwargs: dict = {}
             quant_config = self._build_quantization_config()
             if quant_config is not None:
                 model_kwargs["quantization_config"] = quant_config
@@ -109,16 +119,40 @@ class LLMService:
                 # No quantization — at least pick an efficient dtype per device.
                 model_kwargs["dtype"] = self._resolve_dtype()
 
+            # Device placement.
+            #
+            # On HuggingFace **ZeroGPU** we must NOT use ``device_map="auto"``.
+            # accelerate builds the auto device map by probing the real GPU
+            # (``torch.cuda.mem_get_info`` / ``is_available`` at a low level),
+            # which initialises a *real* CUDA context in the host process —
+            # bypassing the ``spaces`` torch-CUDA patch. Once the host owns a
+            # real CUDA context, ZeroGPU's fork-based worker can no longer
+            # initialise CUDA and every ``@spaces.GPU`` call dies in
+            # ``worker_init`` with ``RuntimeError: No CUDA GPUs are available``.
+            #
+            # Instead we load on CPU and then call ``.to("cuda")``, which the
+            # ``spaces`` layer intercepts to *pack* the weights at startup
+            # (the "ZeroGPU tensors packing" step) without any real CUDA init.
+            # The packed tensors are restored onto the real GPU inside each
+            # forked worker.
+            if not on_zero_gpu:
+                model_kwargs["device_map"] = "auto"
+
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_id,
                 **model_kwargs,
             )
+
+            if on_zero_gpu:
+                # spaces-patched move: packs weights, no real CUDA init here.
+                self._model = self._model.to("cuda")
 
             # Record the concrete device the model actually landed on so
             # callers (e.g. the UI status chip) can report it accurately.
             self.device = str(self._model.device)
             log.info("Model loaded successfully in %.1fs (device=%s, quantized=%s)",
                      time.time() - t0, self.device, quant_config is not None)
+
 
     def _cuda_available(self) -> bool:
         try:
