@@ -33,6 +33,11 @@ def _detect_and_log_device(config) -> str:
     Returns the resolved device string ("cuda", "mps", or "cpu") and logs
     a prominent message so operators can see at a glance where the model
     will run.
+
+    On HuggingFace ZeroGPU the real GPU is only attached inside a
+    ``@spaces.GPU`` worker; the host process sees a patched stub. We detect
+    ZeroGPU and skip CUDA probing to avoid misleading log messages (and
+    potential CUDA-context pollution).
     """
     try:
         import torch
@@ -40,6 +45,22 @@ def _detect_and_log_device(config) -> str:
         log.info("PyTorch not installed – model inference will use CPU "
                  "once torch becomes available.")
         return "cpu"
+
+    # ZeroGPU: the real GPU is only inside @spaces.GPU workers.
+    # The env var LLM_DEVICE is already set to "cuda" by app.py's
+    # _configure_environment() so the dtype resolver picks bfloat16.
+    # We don't probe torch.cuda here because the spaces-patched probe
+    # returns fake data in the host, and probing may contribute to the
+    # "CUDA already initialised" fork-worker problem.
+    is_zero_gpu = os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true", "yes")
+    if is_zero_gpu:
+        log.info("=" * 60)
+        log.info("ZeroGPU runtime — GPU will be attached inside "
+                 "@spaces.GPU workers; hosting process uses CPU. "
+                 "Model weights will load in bfloat16 inside the "
+                 "GPU context on first query.")
+        log.info("=" * 60)
+        return "cuda"  # LLM_DEVICE=cuda tells the dtype resolver to use bf16
 
     device = (config.get("LLM_DEVICE") or "auto").lower()
 
