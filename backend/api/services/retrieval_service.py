@@ -76,6 +76,12 @@ class RetrievalService:
         self.embed_model_name = _cfg(config, "EMBED_MODEL", "BAAI/bge-small-en-v1.5")
         self.per_kg_k = int(_cfg(config, "RETRIEVAL_PER_KG_K", 8))
         self.top_k = int(_cfg(config, "RETRIEVAL_TOP_K", 4))
+        # Context-size / relevance guards (see config.py for rationale). 0 means
+        # "disabled" for the char caps; the score gate is skipped when <= 0.
+        self.max_chunk_chars = int(_cfg(config, "RETRIEVAL_MAX_CHUNK_CHARS", 0))
+        self.max_context_chars = int(_cfg(config, "RETRIEVAL_MAX_CONTEXT_CHARS", 0))
+        self.min_score = float(_cfg(config, "RETRIEVAL_MIN_SCORE", 0.0))
+
 
         self._embedder = None
         self._kgs: list[dict] | None = None  # cached loaded KGs
@@ -131,14 +137,58 @@ class RetrievalService:
                 })
 
         hits.sort(key=lambda h: h["score"], reverse=True)
+
+        # Relevance gate: if the best hit is too weak, the KG simply doesn't
+        # cover this query — inject nothing rather than pad the prompt (and
+        # slow generation) with irrelevant text. Reuses the FAISS scores we
+        # already computed, so it's effectively a free relevance classifier.
+        if self.min_score > 0 and (not hits or hits[0]["score"] < self.min_score):
+            best = hits[0]["score"] if hits else float("nan")
+            log.info("Retrieval: best score %.4f < min_score %.4f — dropping "
+                     "context for this query", best, self.min_score)
+            return {"context": "", "sources": []}
+
+        # Drop individual sub-threshold hits, then keep the top-k survivors.
+        if self.min_score > 0:
+            hits = [h for h in hits if h["score"] >= self.min_score]
         top = hits[:top_k]
 
-        context = "\n\n".join(f"[{h['kg']}] {h['text']}" for h in top)
-        sources = [
-            {"kg": h["kg"], "chunk_id": h["chunk_id"], "score": round(h["score"], 4)}
-            for h in top
-        ]
+        # Trim each chunk and the merged whole so input length (and therefore
+        # prefill time) stays bounded regardless of chunk size.
+        parts: list[str] = []
+        sources: list[dict] = []
+        total = 0
+        for h in top:
+            text = self._truncate(h["text"], self.max_chunk_chars)
+            snippet = f"[{h['kg']}] {text}"
+            if self.max_context_chars > 0 and total + len(snippet) > self.max_context_chars:
+                remaining = self.max_context_chars - total
+                if remaining <= 0:
+                    break
+                snippet = snippet[:remaining]
+                parts.append(snippet)
+                sources.append({
+                    "kg": h["kg"], "chunk_id": h["chunk_id"],
+                    "score": round(h["score"], 4),
+                })
+                break
+            parts.append(snippet)
+            sources.append({
+                "kg": h["kg"], "chunk_id": h["chunk_id"],
+                "score": round(h["score"], 4),
+            })
+            total += len(snippet) + 2  # account for the "\n\n" joiner
+
+        context = "\n\n".join(parts)
         return {"context": context, "sources": sources}
+
+    @staticmethod
+    def _truncate(text: str, max_chars: int) -> str:
+        """Cut text to at most ``max_chars`` (0 disables truncation)."""
+        if max_chars and max_chars > 0 and len(text) > max_chars:
+            return text[:max_chars].rstrip() + " …"
+        return text
+
 
     def refresh(self) -> int:
         """Drop cached indexes so the next query reloads from disk. Returns KG count."""

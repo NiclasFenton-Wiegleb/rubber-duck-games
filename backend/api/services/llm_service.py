@@ -285,13 +285,17 @@ class LLMService:
         system = get_system_prompt(self.config)
 
         context, sources = "", []
-        if use_context:
+        if use_context and self._should_use_context(query):
             context, sources = self._retrieve_context(query)
+        elif use_context:
+            log.info("Skipping retrieval (heuristic gate): query looks "
+                     "conversational/self-contained")
 
         user = query
         if context:
             user = (
                 "Use the following reference context if relevant:\n\n"
+
                 f"{context}\n\nQuestion: {query}"
             )
 
@@ -321,10 +325,14 @@ class LLMService:
         <think>...</think> trace into a separate `reasoning` field.
         """
         context, sources = ("", [])
-        if use_context:
+        if use_context and self._should_use_context(query):
             context, sources = self._retrieve_context(query)
+        elif use_context:
+            log.info("Skipping retrieval (heuristic gate): query looks "
+                     "conversational/self-contained")
 
         system = (
+
             "You are an expert coding assistant. Think step by step, consider "
             "edge cases, and produce a thorough, well-structured answer with "
             "code examples where helpful. /think"
@@ -376,15 +384,28 @@ class LLMService:
 
         # Build kwargs for model.generate – pass the raw tensor and, if
         # available, the attention_mask so the model knows what to ignore.
+        #
+        # ``use_cache=True`` keeps the KV-cache on so each new token is a single
+        # incremental step instead of re-attending the whole prefix — the single
+        # most important decode-speed flag.
         generate_kwargs: dict = {
             "max_new_tokens": max_new_tokens,
-            "do_sample": temperature > 0,
-            "temperature": max(temperature, 1e-4),
-            "top_p": 0.95,
             "pad_token_id": self._tokenizer.eos_token_id,
+            "use_cache": True,
         }
+        # Greedy fast-path: when temperature is 0 we skip sampling entirely
+        # (no top_p/temperature work), which is both faster and deterministic.
+        if temperature > 0:
+            generate_kwargs.update({
+                "do_sample": True,
+                "temperature": max(temperature, 1e-4),
+                "top_p": 0.95,
+            })
+        else:
+            generate_kwargs["do_sample"] = False
         if hasattr(inputs, "attention_mask"):
             generate_kwargs["attention_mask"] = inputs.attention_mask
+
 
         # Stop as soon as a complete JSON object has been emitted so we don't
         # waste tokens/time padding to the full budget (and so the answer is a
@@ -474,8 +495,42 @@ class LLMService:
         return None, text
 
 
+    # Queries that are conversational, trivial, or self-contained almost never
+    # benefit from KG/RAG context, so we skip retrieval entirely for them. This
+    # shortens the pipeline (no embed + FAISS search) AND avoids inflating the
+    # prompt, both of which speed up the request. The KG relevance-score gate in
+    # RetrievalService is the second line of defence for queries that pass here
+    # but still don't match anything useful.
+    _SKIP_CONTEXT_PREFIXES = (
+        "hi", "hello", "hey", "thanks", "thank you", "ok", "okay", "yes", "no",
+        "sure", "cool", "nice", "great", "got it",
+    )
+
+    def _should_use_context(self, query: str) -> bool:
+        """Heuristically decide whether a query warrants KG/RAG retrieval.
+
+        Cheap, model-free gate: skip retrieval for very short turns and obvious
+        conversational fillers (greetings, acknowledgements). Everything else
+        falls through to retrieval, where the score gate can still drop weak
+        matches. Returns True when context *should* be retrieved.
+        """
+        q = (query or "").strip().lower()
+        if not q:
+            return False
+        # Very short utterances ("ok", "thanks!", "why?") rarely need a KG.
+        if len(q.split()) <= 2:
+            return False
+        # Leading conversational filler with nothing substantive after it.
+        for prefix in self._SKIP_CONTEXT_PREFIXES:
+            if q == prefix or q.startswith(prefix + " ") or q.startswith(prefix + ","):
+                # Keep context if there's a real question riding along.
+                if "?" not in q and len(q.split()) <= 4:
+                    return False
+        return True
+
     def _retrieve_context(self, query: str) -> tuple[str, list[dict]]:
         """
+
         Retrieve the most relevant context across *all* knowledge graphs in the
         attached storage, via the shared (cached) RetrievalService.
 
