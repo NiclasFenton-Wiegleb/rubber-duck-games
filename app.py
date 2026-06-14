@@ -1210,18 +1210,38 @@ def _repo_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
 
 
 def _repo_followup_prompt(repo: str, branch: str, destination: str, problem: str, followup: str) -> str:
+    """Build a focused follow-up prompt for the next round of duck questions.
+
+    The follow-up only needs to refresh the Duck Questions section, so we reuse
+    the small, single-section schema (the same one the initial flow uses) rather
+    than asking the model to re-emit the entire session. Requesting the full
+    schema here overflows the short token budget, truncates the JSON, and breaks
+    the required format — so we keep the ask tight and conformant instead.
+    """
     return "\n".join(
-        [
-            _repo_prompt(repo, branch, destination, problem),
-            "",
+        _session_header(repo, branch, destination, problem)
+        + [
             "The user is continuing the same debugging conversation.",
             "Their latest reply or observation:",
             (followup or "").strip(),
             "",
-            "Respond in the same structured duck session format. Update the duck questions, repo findings, "
-            "fix options, and refactor suggestion based on this follow-up.",
+            "Based on that reply, return EXACTLY this shape with up to 4 short, updated",
+            "diagnostic questions that guide the user closer to the cause:",
+            "",
+            "{",
+            '  "conversation": {',
+            '    "messages": [',
+            '      {"id": "q1", "role": "duck", "kind": "question", "content": "<first diagnostic question>", "intent": "<why you ask this>", "expects_user_reply": true},',
+            '      {"id": "q2", "role": "duck", "kind": "question", "content": "<second question>", "intent": "<intent>", "expects_user_reply": true},',
+            '      {"id": "q3", "role": "duck", "kind": "question", "content": "<third question>", "intent": "<intent>", "expects_user_reply": true},',
+            '      {"id": "q4", "role": "duck", "kind": "question", "content": "<fourth question>", "intent": "<intent>", "expects_user_reply": true}',
+            "    ],",
+            '    "next_prompt_hint": "<a short hint for what the user could try next>"',
+            "  }",
+            "}",
         ]
     )
+
 
 
 # ── Per-section prompts (sequential, tab-by-tab generation) ──────────────────
@@ -1505,7 +1525,7 @@ def _pending_card(title: str) -> str:
 
 
 def ask_repo(repo: str, branch: str, destination: str, problem: str,
-             use_context: bool, max_new_tokens: int, temperature: float):
+             use_context: bool, temperature: float):
     """Generate the duck session one tab at a time and stream each as it's ready.
 
     Rather than producing the whole schema in a single (slow) call that blocks
@@ -1566,7 +1586,7 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
     rendered = dict(pending)
     for title, prompt_fn, key in sections:
         prompt = prompt_fn(repo, branch, destination, problem)
-        answer, _ = ask(prompt, use_context, max_new_tokens, temperature,
+        answer, _ = ask(prompt, use_context, 384, temperature,
                         stop_on_json=True)
         fragment = parse_partial_json(answer)
         if fragment:
@@ -1594,13 +1614,13 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
 
 
 def continue_repo_conversation(repo: str, branch: str, destination: str, problem: str, followup: str,
-                               use_context: bool, max_new_tokens: int, temperature: float):
+                               use_context: bool, temperature: float):
     followup = (followup or "").strip()
     if not followup:
         return gr.update(), ""
 
     prompt = _repo_followup_prompt(repo, branch, destination, problem, followup)
-    answer, raw = ask(prompt, use_context, max_new_tokens, temperature)
+    answer, raw = ask(prompt, use_context, 384, temperature, stop_on_json=True)
     structured, _ = normalize_structured_answer(
         answer,
         repo_url=repo,
@@ -1670,7 +1690,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
 
                 with gr.Accordion("Model options", open=False):
                     use_context = gr.Checkbox(value=True, label="Use knowledge-graph context")
-                    max_new_tokens = gr.Slider(64, 2048, value=768, step=64, label="Max new tokens")
                     temperature = gr.Slider(0.0, 1.5, value=0.65, step=0.05, label="Temperature")
 
             with gr.Column(elem_classes=["session-panel"]):
@@ -1744,7 +1763,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             destination_input,
             problem_input,
             use_context,
-            max_new_tokens,
             temperature,
         ],
         outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
@@ -1757,7 +1775,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             destination_input,
             problem_input,
             use_context,
-            max_new_tokens,
             temperature,
         ],
         outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
@@ -1771,7 +1788,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             problem_input,
             followup_input,
             use_context,
-            max_new_tokens,
             temperature,
         ],
         outputs=[duck_questions, followup_input],
@@ -1785,7 +1801,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             problem_input,
             followup_input,
             use_context,
-            max_new_tokens,
             temperature,
         ],
         outputs=[duck_questions, followup_input],
