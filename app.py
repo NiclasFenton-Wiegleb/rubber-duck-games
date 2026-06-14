@@ -53,7 +53,54 @@ except ImportError:
     _SPACES_AVAILABLE = False
     log.info("spaces module not found — running in local mode (no ZeroGPU)")
 
+
+# ── Host-side CUDA-init tripwire (ZeroGPU diagnostics) ───────────────────────
+# On ZeroGPU the host process must NEVER initialise a real CUDA context: each
+# ``@spaces.GPU`` worker is *forked* from this process, and if CUDA was already
+# initialised here the worker dies in ``worker_init`` with
+# "RuntimeError: No CUDA GPUs are available" — regardless of where the model
+# lives. The failure trace points only at the spaces wrapper, never at the line
+# in *our* code that actually poisoned CUDA, which makes it very hard to debug.
+#
+# This tripwire wraps torch's lazy CUDA initialiser so the *first* real CUDA
+# init in the host is logged with a full Python stack trace, pinpointing the
+# exact call that touched CUDA outside a ``@spaces.GPU`` worker. It is a no-op
+# off ZeroGPU.
+def _install_cuda_init_tripwire() -> None:
+    import traceback
+
+    try:
+        import torch
+    except Exception:  # torch not importable yet — nothing to guard
+        return
+
+    cuda = torch.cuda
+    if getattr(cuda, "_rdg_tripwire_installed", False):
+        return
+
+    _orig_lazy_init = cuda._lazy_init
+
+    def _traced_lazy_init(*args, **kwargs):
+        log.error(
+            "⚠️ HOST CUDA INIT DETECTED — something initialised a real CUDA "
+            "context in the hosting process (outside a @spaces.GPU worker). "
+            "This is what makes the forked ZeroGPU worker die in worker_init "
+            "with 'No CUDA GPUs are available'. Offending call stack:\n%s",
+            "".join(traceback.format_stack()),
+        )
+        return _orig_lazy_init(*args, **kwargs)
+
+    cuda._lazy_init = _traced_lazy_init
+    cuda._rdg_tripwire_installed = True
+    log.info("Host CUDA-init tripwire installed (ZeroGPU diagnostics).")
+
+
+if _SPACES_AVAILABLE:
+    _install_cuda_init_tripwire()
+
+
 # ── Paths ────────────────────────────────────────────────────────────────────
+
 ROOT_DIR = Path(__file__).resolve().parent
 BACKEND_DIR = ROOT_DIR / "backend"
 

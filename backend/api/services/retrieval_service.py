@@ -74,6 +74,18 @@ class RetrievalService:
         self.output_dir = Path(output) if output else None
 
         self.embed_model_name = _cfg(config, "EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+        # Pin the embedder to an explicit device. On a ZeroGPU Space the host
+        # process must NEVER create a CUDA context (it forks the @spaces.GPU
+        # workers; a CUDA-initialised host makes them die in ``worker_init``
+        # with "No CUDA GPUs are available"). With no device argument,
+        # SentenceTransformer auto-selects "cuda" whenever ``torch.cuda
+        # .is_available()`` is truthy — and the ``spaces`` patch makes that
+        # report True in the host — which would initialise a real CUDA context
+        # here. EMBED_DEVICE defaults to "cpu" for exactly this reason (the
+        # embedder is tiny, so CPU is plenty fast); override on dedicated-GPU
+        # Spaces if desired.
+        self.embed_device = _cfg(config, "EMBED_DEVICE", "cpu")
+
         self.per_kg_k = int(_cfg(config, "RETRIEVAL_PER_KG_K", 8))
         self.top_k = int(_cfg(config, "RETRIEVAL_TOP_K", 4))
         # Context-size / relevance guards (see config.py for rationale). 0 means
@@ -220,8 +232,16 @@ class RetrievalService:
             with self._load_lock:
                 if self._embedder is None:
                     from sentence_transformers import SentenceTransformer
-                    self._embedder = SentenceTransformer(self.embed_model_name)
+                    # Pass an explicit device so SentenceTransformer never
+                    # auto-selects "cuda" and initialises a real CUDA context
+                    # (fatal in a ZeroGPU host — see __init__ for details).
+                    log.info("Retrieval: loading embedder '%s' on device=%s",
+                             self.embed_model_name, self.embed_device)
+                    self._embedder = SentenceTransformer(
+                        self.embed_model_name, device=self.embed_device
+                    )
         return self._embedder
+
 
     def _ensure_loaded(self):
         if self._kgs is not None:
