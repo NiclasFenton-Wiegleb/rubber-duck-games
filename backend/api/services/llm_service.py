@@ -22,6 +22,7 @@ any HuggingFace model id compatible with ``AutoModelForCausalLM``.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -126,17 +127,37 @@ class LLMService:
         except Exception:
             return False
 
+    @staticmethod
+    def _on_zero_gpu() -> bool:
+        """Detect a HuggingFace ZeroGPU runtime.
+
+        ZeroGPU sets ``SPACES_ZERO_GPU`` in the environment. On that runtime the
+        physical GPU is attached only inside a ``@spaces.GPU`` worker, which the
+        ``spaces`` package spins up by *forking* the main process. bitsandbytes
+        must not be used there (see ``_build_quantization_config``).
+        """
+        return os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true", "yes")
+
     def _resolve_dtype(self):
         """Pick an explicit dtype: half precision on GPU, ``auto`` on CPU.
 
         On a T4 the checkpoint's native dtype is often fp32, which is the main
         reason generation was slow. T4 has no bf16 support, so we use fp16
         there and prefer bf16 only on GPUs that report support for it.
+
+        On ZeroGPU CUDA is not visible in the host process (it is attached only
+        inside a ``@spaces.GPU`` worker), so ``torch.cuda.is_bf16_supported()``
+        would report False here even though the worker GPU supports bf16. We
+        therefore prefer bf16 on ZeroGPU explicitly — the ``spaces`` layer packs
+        the bf16 tensors at startup and unpacks them onto the real GPU.
         """
         try:
             import torch
         except Exception:
             return "auto"
+
+        if self._on_zero_gpu():
+            return torch.bfloat16
 
         if not torch.cuda.is_available():
             return "auto"  # CPU: let the checkpoint decide (fp32 typically).
@@ -150,8 +171,22 @@ class LLMService:
         4-bit needs CUDA + bitsandbytes; on CPU (or if the dependency is
         missing) we silently fall back to a normal half/auto-precision load so
         the app keeps working everywhere.
+
+        On HuggingFace **ZeroGPU** we deliberately skip bitsandbytes entirely.
+        bitsandbytes initialises a *real* CUDA context in the host process at
+        load time (it bypasses the ``spaces`` torch-CUDA patch with its own
+        native CUDA calls). That poisons ZeroGPU's fork-based worker so the very
+        first ``@spaces.GPU`` call dies in ``worker_init`` with
+        ``RuntimeError: No CUDA GPUs are available``. The ZeroGPU partition has
+        plenty of VRAM, so we just load in half precision (bf16/fp16) instead —
+        no quantization needed.
         """
         if not self.load_in_4bit:
+            return None
+        if self._on_zero_gpu():
+            log.warning("LLM_LOAD_IN_4BIT set but running on ZeroGPU — skipping "
+                        "bitsandbytes (it breaks ZeroGPU's fork worker) and "
+                        "loading in half precision instead.")
             return None
         if not self._cuda_available():
             log.warning("LLM_LOAD_IN_4BIT set but CUDA is unavailable — "
