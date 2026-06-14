@@ -86,7 +86,22 @@ class Config:
     # How many chunks to pull from each KG before merging.
     RETRIEVAL_PER_KG_K = int(os.getenv("RETRIEVAL_PER_KG_K", "8"))
     # How many chunks to keep in the final merged context across all KGs.
-    RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "4"))
+    # Trimmed from 4 → 3: every extra chunk (~400 tokens) inflates prefill and
+    # is re-attended on every generated token, so fewer chunks = faster RAG.
+    RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "3"))
+    # Hard cap on characters kept per chunk before it is injected into the
+    # prompt. Long chunks get truncated so a single oversized snippet can't blow
+    # up the context window. 0 disables the per-chunk cap.
+    RETRIEVAL_MAX_CHUNK_CHARS = int(os.getenv("RETRIEVAL_MAX_CHUNK_CHARS", "1200"))
+    # Hard cap on the total merged context (across all kept chunks). Keeps the
+    # input length — and therefore prefill time — bounded. 0 disables the cap.
+    RETRIEVAL_MAX_CONTEXT_CHARS = int(os.getenv("RETRIEVAL_MAX_CONTEXT_CHARS", "3000"))
+    # Minimum FAISS similarity score a hit must clear to be injected. Acts as a
+    # "free" relevance classifier (reusing the embedder we already load): if the
+    # best chunk is weaker than this, we drop context entirely rather than feed
+    # the model irrelevant text. Tune per embedding model; 0 disables the gate.
+    RETRIEVAL_MIN_SCORE = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.30"))
+
 
     # ── Prompting ───────────────────────────────────────────────────────────
     # Local text file holding the system prompt prepended to every query.
@@ -100,7 +115,11 @@ class Config:
     # Set via LLM_MODEL_ID env var.
     LLM_MODEL_ID = os.getenv("LLM_MODEL_ID", "niclasfw/smollm3-3b-codex")
     LLM_DEVICE = os.getenv("LLM_DEVICE", "auto")  # auto | cpu | cuda | mps
-    LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "512"))
+    # Output length is the single biggest wall-clock lever (every token is a
+    # forward pass), so the simple/fast path defaults to a tighter budget. The
+    # JSON early-stop (stop_on_json) usually halts well before this anyway.
+    LLM_MAX_NEW_TOKENS = int(os.getenv("LLM_MAX_NEW_TOKENS", "256"))
+
     LLM_COMPLEX_MAX_NEW_TOKENS = int(os.getenv("LLM_COMPLEX_MAX_NEW_TOKENS", "2048"))
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.7"))
     # Lazily load the model on first request rather than at startup.
