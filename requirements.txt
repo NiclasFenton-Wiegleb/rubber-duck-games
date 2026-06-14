@@ -40,10 +40,23 @@ torch>=2.8,<2.12
 # ("'list' object has no attribute 'keys'").
 transformers>=5.5.0
 accelerate>=0.30
-# 4-bit (NF4) weight quantization for faster, lower-VRAM GPU inference
-# (LLM_LOAD_IN_4BIT). Required for the fine-tuned SmolLM3 on the ZeroGPU Space.
-# CUDA-only; harmless on CPU-only boxes (skipped at load if CUDA is absent).
-bitsandbytes>=0.43; platform_system != "Darwin"
+# ── bitsandbytes is DELIBERATELY NOT installed on the ZeroGPU Space ──────────
+# ROOT CAUSE of the recurring "RuntimeError: No CUDA GPUs are available" inside
+# spaces' `worker_init → torch.init() → torch.Tensor([0]).cuda()`:
+#
+#   bitsandbytes initialises a real CUDA driver context *on import* using its
+#   own native ctypes calls (cuInit/cudaGetDeviceCount), bypassing the `spaces`
+#   torch-CUDA emulation entirely — so none of the host tripwires catch it.
+#   transformers/accelerate import bitsandbytes while loading the model in the
+#   host process (their `is_bitsandbytes_available()` checks import the package).
+#   Once a CUDA context exists in the host, the forked ZeroGPU worker inherits a
+#   broken CUDA state and `torch.init()` dies with "No CUDA GPUs are available".
+#
+# On ZeroGPU we never use 4-bit anyway (llm_service skips bitsandbytes and loads
+# in bfloat16 — see the "skipping bitsandbytes" log line), so installing it here
+# is pure downside. Keep it ONLY in backend/requirements.txt for real,
+# persistent-CUDA deployments where LLM_LOAD_IN_4BIT is genuinely used.
+# DO NOT add bitsandbytes to this (HuggingFace Space) requirements file.
 
 
 # ── Gradio frontend + local API client ─────────────────────────

@@ -54,6 +54,27 @@ except ImportError:
     log.info("spaces module not found — running in local mode (no ZeroGPU)")
 
 
+# ── Block bitsandbytes on ZeroGPU (prevents the forked-worker CUDA crash) ─────
+# bitsandbytes initialises a *real* CUDA driver context the moment it is
+# imported (native cuInit/cudaGetDeviceCount via ctypes — it bypasses the
+# `spaces` torch-CUDA emulation, so the host tripwires above never see it).
+# transformers / accelerate import bitsandbytes while loading the model in this
+# host process to probe `is_bitsandbytes_available()`. Once a CUDA context
+# exists in the host, every *forked* @spaces.GPU worker inherits a broken CUDA
+# state and dies in `worker_init` → `torch.init()` with
+# "RuntimeError: No CUDA GPUs are available".
+#
+# We never use 4-bit on ZeroGPU (llm_service loads in bfloat16 there), so we
+# defensively poison the import slot: `import bitsandbytes` now raises
+# ImportError, which transformers/accelerate handle gracefully as "not
+# available". This is a belt-and-suspenders guard on top of bitsandbytes being
+# absent from the Space's requirements.txt — it neutralises stale build caches
+# or transitive re-installs. No-op off ZeroGPU.
+if _SPACES_AVAILABLE:
+    sys.modules.setdefault("bitsandbytes", None)
+    log.info("bitsandbytes import blocked on ZeroGPU host (forked-worker CUDA safety).")
+
+
 # ── Host-side CUDA-init tripwire (ZeroGPU diagnostics) ───────────────────────
 # On ZeroGPU the host process must NEVER initialise a real CUDA context: each
 # ``@spaces.GPU`` worker is *forked* from this process, and if CUDA was already

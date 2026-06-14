@@ -26,11 +26,59 @@ POST /api/knowledge-graph/build
         }
 """
 
+import json as _json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 from flask import Blueprint, current_app, jsonify, request
 
 from api.services.knowledge_graph_service import KnowledgeGraphService
 
 kg_bp = Blueprint("knowledge_graph", __name__)
+
+# Must match RESULT_SENTINEL in backend/kg_build_cli.py.
+_RESULT_SENTINEL = "KG_BUILD_RESULT_JSON:"
+
+
+def _on_zero_gpu() -> bool:
+    return os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true", "yes")
+
+
+def _build_in_subprocess(source_path: str, kg_name: str, upload: bool) -> dict:
+    """Build the KG in a separate process — required on ZeroGPU.
+
+    The build imports spaCy/thinc + sentence-transformers, which probe
+    ``torch.cuda`` and trigger a real low-level CUDA init. On a ZeroGPU host that
+    poisons the CUDA state inherited by every forked ``@spaces.GPU`` worker, so
+    the next generation dies with "No CUDA GPUs are available". Running the build
+    out-of-process keeps the host clean. See backend/kg_build_cli.py for details.
+    """
+    cli = Path(__file__).resolve().parents[2] / "kg_build_cli.py"
+    cmd = [
+        sys.executable, str(cli),
+        "--source-path", str(source_path),
+        "--kg-name", str(kg_name),
+    ]
+    if upload:
+        cmd.append("--upload")
+
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=os.environ.copy())
+
+    # Surface the child's logs (it logs the full build pipeline to stderr).
+    for line in (proc.stderr or "").splitlines():
+        current_app.logger.info("[kg-build] %s", line)
+
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1] if tail else f"exit code {proc.returncode}"
+        raise RuntimeError(f"KG build subprocess failed: {detail}")
+
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith(_RESULT_SENTINEL):
+            return _json.loads(line[len(_RESULT_SENTINEL):])
+    raise RuntimeError("KG build subprocess did not return a result payload.")
 
 
 @kg_bp.post("/build")
@@ -41,15 +89,27 @@ def build_knowledge_graph():
     kg_name = payload.get("kg_name") or current_app.config.get("KG_NAME", "default")
     upload = payload.get("upload", False)
 
-    service = KnowledgeGraphService(current_app.config)
+    # Validate the source path here so we keep clean 404 semantics even when the
+    # actual build runs out-of-process (where the exception type is lost).
+    if not Path(source_path).exists():
+        return jsonify({"status": "error",
+                        "message": f"Source path does not exist: {source_path}"}), 404
 
     try:
-        result = service.build(source_path=source_path, kg_name=kg_name, upload=upload)
+        if _on_zero_gpu():
+            # ZeroGPU: isolate the CUDA-probing build so it can't poison the
+            # host process that forks the @spaces.GPU workers.
+            result = _build_in_subprocess(source_path, kg_name, upload)
+        else:
+            # Local / dedicated-GPU: build in-process (faster, no re-import).
+            service = KnowledgeGraphService(current_app.config)
+            result = service.build(source_path=source_path, kg_name=kg_name, upload=upload)
     except FileNotFoundError as exc:
         return jsonify({"status": "error", "message": str(exc)}), 404
     except Exception as exc:  # noqa: BLE001 - surface any pipeline failure
         current_app.logger.exception("Knowledge graph build failed")
         return jsonify({"status": "error", "message": str(exc)}), 500
+
 
     # Auto-refresh the retrieval service so the new KG is available immediately
     # for subsequent RAG queries without needing a restart.
