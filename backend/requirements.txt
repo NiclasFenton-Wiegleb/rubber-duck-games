@@ -20,7 +20,13 @@ huggingface_hub>=1.5,<2.0
 tqdm>=4.66
 
 # ── Local small language model ─────────────────────────────────
-torch>=2.4
+# ZeroGPU: torch must stay inside the `spaces` CUDA-emulation supported window
+# (torch 2.8.0 → latest). An out-of-range torch is left unpatched and the
+# forked @spaces.GPU worker dies in `worker_init` with
+# `RuntimeError: No CUDA GPUs are available`. Keep in sync with root
+# requirements.txt.
+torch>=2.8,<2.12
+
 # Gemma 4 (google/gemma-4-E4B-it) is only recognised by AutoProcessor from
 # transformers >= 5.5.0. Older versions fail with "Unrecognized processing
 # class" and then crash in the AutoTokenizer fallback
@@ -35,7 +41,11 @@ bitsandbytes>=0.43; platform_system != "Darwin"
 
 # ── HuggingFace ZeroGPU (on-demand GPU) ────────────────────────
 # Provides the @spaces.GPU decorator used by the Space entry point (app.py).
-spaces>=0.30
+# Use a recent release so the ZeroGPU CUDA-emulation/patching layer matches the
+# installed torch (>=2.8); older `spaces` builds leave modern torch unpatched
+# and break the forked worker. Keep in sync with root requirements.txt.
+spaces>=0.42.0
+
 
 # After install, download the spaCy English model:
 #   python -m spacy download en_core_web_sm

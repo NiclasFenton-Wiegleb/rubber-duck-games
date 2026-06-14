@@ -25,7 +25,15 @@ huggingface_hub>=1.5,<2.0
 tqdm>=4.66
 
 # ── Local small language model ─────────────────────────────────
-torch>=2.2
+# IMPORTANT (ZeroGPU): the `spaces` CUDA-emulation layer only patches a
+# *supported* torch. Per the official ZeroGPU docs the supported range is
+# torch 2.8.0 → latest (2.8.0, 2.9.1, 2.10.0, 2.11.0, …). If an out-of-range
+# torch gets installed, `spaces` cannot patch it and the forked @spaces.GPU
+# worker dies in `worker_init` → `torch.init()` with
+# `RuntimeError: No CUDA GPUs are available` (even though the host never
+# touched CUDA). Keep torch inside the supported window.
+torch>=2.8,<2.12
+
 # Gemma 4 (google/gemma-4-E4B-it) is only recognised by AutoProcessor from
 # transformers >= 5.5.0. Older versions fail with "Unrecognized processing
 # class" and then crash in the AutoTokenizer fallback
@@ -50,7 +58,12 @@ requests>=2.31
 # Provides the @spaces.GPU decorator. A ZeroGPU Space refuses to start unless
 # at least one @spaces.GPU function is detected, and a GPU is only attached for
 # the duration of such a call (no persistent CUDA device at startup).
-spaces>=0.30
+#
+# Use a recent `spaces` release: the ZeroGPU CUDA-emulation/patching layer must
+# match the installed torch (>=2.8). Older `spaces` builds only know how to
+# patch older torch and will leave a modern torch unpatched, breaking the
+# forked worker. Keep this current.
+spaces>=0.42.0
 
 
 # After install, download the spaCy English model (only needed for KG building):

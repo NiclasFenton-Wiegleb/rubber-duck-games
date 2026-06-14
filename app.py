@@ -78,25 +78,72 @@ def _install_cuda_init_tripwire() -> None:
     if getattr(cuda, "_rdg_tripwire_installed", False):
         return
 
-    _orig_lazy_init = cuda._lazy_init
+    import os as _os
 
-    def _traced_lazy_init(*args, **kwargs):
-        log.error(
-            "⚠️ HOST CUDA INIT DETECTED — something initialised a real CUDA "
-            "context in the hosting process (outside a @spaces.GPU worker). "
-            "This is what makes the forked ZeroGPU worker die in worker_init "
-            "with 'No CUDA GPUs are available'. Offending call stack:\n%s",
-            "".join(traceback.format_stack()),
-        )
-        return _orig_lazy_init(*args, **kwargs)
+    _host_pid = _os.getpid()
 
-    cuda._lazy_init = _traced_lazy_init
+    # ``torch.cuda.device_count()`` is memoised (lru_cache / a module global) the
+    # first time it runs. On a ZeroGPU host there is no visible GPU, so that first
+    # call caches **0** — and because each @spaces.GPU worker is *forked* from the
+    # host, every worker inherits the cached 0 and dies in ``worker_init`` with
+    # "No CUDA GPUs are available", even though ``spaces`` assigned it a real GPU.
+    # We trace the *first host-side* call so the poisoning is visible in the logs;
+    # calls from inside a forked worker (different PID) are ignored.
+    _orig_device_count = cuda.device_count
+
+    def _traced_device_count(*args, **kwargs):
+        result = _orig_device_count(*args, **kwargs)
+        if _os.getpid() == _host_pid and not getattr(cuda, "_rdg_dc_logged", False):
+            cuda._rdg_dc_logged = True
+            log.warning(
+                "HOST torch.cuda.device_count() -> %s (first host call). If this "
+                "is 0 it will be cached and inherited by the forked ZeroGPU "
+                "worker, breaking GPU init. Caller:\n%s",
+                result, "".join(traceback.format_stack()),
+            )
+        return result
+
+    cuda.device_count = _traced_device_count
+
     cuda._rdg_tripwire_installed = True
-    log.info("Host CUDA-init tripwire installed (ZeroGPU diagnostics).")
+    log.info("Host CUDA device-count tripwire installed (ZeroGPU diagnostics).")
+
+
+def _reset_host_cuda_cache() -> None:
+    """Clear torch's memoised CUDA device count in the *host* before a worker fork.
+
+    On ZeroGPU the host has no visible GPU, so any earlier query cached a device
+    count of 0. The @spaces.GPU worker is forked from the host and inherits that
+    cache, then fails in ``worker_init`` with "No CUDA GPUs are available". By
+    clearing the cache here — in the host, right before the worker is spawned —
+    the freshly forked worker re-queries CUDA (with its assigned GPU now visible)
+    instead of reusing the poisoned 0. No-op off ZeroGPU / if torch is absent.
+    """
+    try:
+        import torch
+    except Exception:
+        return
+    cuda = torch.cuda
+    # torch >= 2.x: device_count is wrapped with functools.lru_cache.
+    dc = getattr(cuda, "device_count", None)
+    cache_clear = getattr(dc, "cache_clear", None)
+    if callable(cache_clear):
+        try:
+            cache_clear()
+        except Exception:
+            pass
+    # Some torch builds memoise via a module-level global instead.
+    for attr in ("_cached_device_count", "_device_count"):
+        if hasattr(cuda, attr):
+            try:
+                setattr(cuda, attr, None)
+            except Exception:
+                pass
 
 
 if _SPACES_AVAILABLE:
     _install_cuda_init_tripwire()
+
 
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -953,9 +1000,17 @@ def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float
              "stop_on_json=%s", len(message), use_context, max_new_tokens,
              temperature, stop_on_json)
 
+    # Clear torch's host-side CUDA device-count cache right before the ZeroGPU
+    # worker is forked, so the worker re-detects its freshly-assigned GPU instead
+    # of inheriting the host's cached "0 devices" (the cause of the worker dying
+    # in worker_init with "No CUDA GPUs are available"). No-op off ZeroGPU.
+    if _SPACES_AVAILABLE:
+        _reset_host_cuda_cache()
+
     try:
         result = _generate_simple(message, use_context, max_new_tokens, temperature,
                                   stop_on_json)
+
     except Exception as exc:  # noqa: BLE001
         log.exception("Generation failed: %s", exc)
         return f"⚠️ Generation failed: {exc}", json.dumps({"error": str(exc)}, indent=2)
