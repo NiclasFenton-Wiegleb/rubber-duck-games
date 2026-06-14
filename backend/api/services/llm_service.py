@@ -85,12 +85,20 @@ class LLMService:
         Device placement is runtime-aware:
           * Off ZeroGPU we pass ``device_map="auto"`` so accelerate places
             layers optimally across the available device(s).
-          * On ZeroGPU we deliberately avoid ``device_map="auto"`` (it makes
-            accelerate probe the real GPU and initialise a CUDA context in the
-            host process, which poisons the forked ``@spaces.GPU`` worker).
-            Instead we load on CPU and call the ``spaces``-patched ``.to("cuda")``
-            so the weights are packed at startup with no real CUDA init.
+          * On ZeroGPU we deliberately keep the model **on CPU in the host
+            process** and never touch CUDA here. The host process must not
+            create a real CUDA context: ZeroGPU spins up each ``@spaces.GPU``
+            worker by *forking* the host, and a forked child cannot initialise
+            CUDA if the parent already owns a CUDA context (the worker dies in
+            ``worker_init`` with ``RuntimeError: No CUDA GPUs are available``).
+
+            Keeping the weights resident on CPU means every forked worker
+            inherits them cheaply (copy-on-write). The actual move to the GPU
+            happens lazily inside the worker via ``_ensure_gpu_placement()``,
+            which is only ever reached from ``_chat`` — and ``_chat`` only runs
+            inside the ``@spaces.GPU`` worker, where CUDA is real.
         """
+
 
 
         if self._model is not None:
@@ -121,20 +129,20 @@ class LLMService:
 
             # Device placement.
             #
-            # On HuggingFace **ZeroGPU** we must NOT use ``device_map="auto"``.
-            # accelerate builds the auto device map by probing the real GPU
-            # (``torch.cuda.mem_get_info`` / ``is_available`` at a low level),
-            # which initialises a *real* CUDA context in the host process —
-            # bypassing the ``spaces`` torch-CUDA patch. Once the host owns a
-            # real CUDA context, ZeroGPU's fork-based worker can no longer
-            # initialise CUDA and every ``@spaces.GPU`` call dies in
+            # On HuggingFace **ZeroGPU** we must NOT use ``device_map="auto"``
+            # and we must NOT touch CUDA at all in the host process. accelerate's
+            # auto device map probes the real GPU (``torch.cuda.mem_get_info`` /
+            # ``is_available`` at a low level), and even a ``.to("cuda")`` move
+            # can initialise a *real* CUDA context in the host process. Once the
+            # host owns a real CUDA context, ZeroGPU's fork-based worker can no
+            # longer initialise CUDA and every ``@spaces.GPU`` call dies in
             # ``worker_init`` with ``RuntimeError: No CUDA GPUs are available``.
             #
-            # Instead we load on CPU and then call ``.to("cuda")``, which the
-            # ``spaces`` layer intercepts to *pack* the weights at startup
-            # (the "ZeroGPU tensors packing" step) without any real CUDA init.
-            # The packed tensors are restored onto the real GPU inside each
-            # forked worker.
+            # So on ZeroGPU we load the weights and leave them on **CPU** in the
+            # host. Each forked ``@spaces.GPU`` worker inherits them (copy-on-
+            # write) and moves them onto the real GPU lazily via
+            # ``_ensure_gpu_placement()`` — which only ever runs inside the
+            # worker, where CUDA is real.
             if not on_zero_gpu:
                 model_kwargs["device_map"] = "auto"
 
@@ -143,15 +151,39 @@ class LLMService:
                 **model_kwargs,
             )
 
-            if on_zero_gpu:
-                # spaces-patched move: packs weights, no real CUDA init here.
-                self._model = self._model.to("cuda")
-
             # Record the concrete device the model actually landed on so
-            # callers (e.g. the UI status chip) can report it accurately.
+            # callers (e.g. the UI status chip) can report it accurately. On
+            # ZeroGPU this is "cpu" in the host; the worker reports "cuda:0"
+            # after ``_ensure_gpu_placement()`` runs.
             self.device = str(self._model.device)
             log.info("Model loaded successfully in %.1fs (device=%s, quantized=%s)",
                      time.time() - t0, self.device, quant_config is not None)
+
+    def _ensure_gpu_placement(self):
+        """Move the model onto CUDA — **only ever called inside a worker**.
+
+        On ZeroGPU the model is loaded on CPU in the host process (so the host
+        never creates a CUDA context that would poison the forked worker). The
+        physical GPU is attached only inside a ``@spaces.GPU`` worker, so the
+        CPU→GPU move must happen here, lazily, on the first generation in the
+        worker. This is a no-op once the model already lives on CUDA, and a
+        no-op entirely off ZeroGPU (where ``device_map="auto"`` already placed
+        the weights).
+        """
+        if not self._on_zero_gpu():
+            return
+        try:
+            import torch
+
+            if self._model is not None and self._model.device.type != "cuda":
+                self._model = self._model.to("cuda")
+                self.device = str(self._model.device)
+                log.info("Model moved onto GPU inside worker (device=%s)",
+                         self.device)
+        except Exception:
+            log.exception("Failed to move model onto GPU inside worker")
+            raise
+
 
 
     def _cuda_available(self) -> bool:
@@ -400,9 +432,14 @@ class LLMService:
         t0 = time.time()
 
         self.load()
+        # On ZeroGPU the weights are resident on CPU in the host; this is the
+        # first point that runs *inside* the @spaces.GPU worker, so move them
+        # onto the real GPU here (no-op off ZeroGPU / once already on CUDA).
+        self._ensure_gpu_placement()
         import torch
 
         inputs = self._tokenizer.apply_chat_template(
+
             messages,
             add_generation_prompt=True,
             return_tensors="pt",

@@ -89,9 +89,11 @@ def _configure_environment() -> str:
     if "LLM_DEVICE" not in os.environ:
         if _SPACES_AVAILABLE:
             log.info("ZeroGPU runtime detected — setting LLM_DEVICE=cuda; the "
-                     "model is eager-loaded at startup and packed by the spaces "
-                     "CUDA-emulation layer (no manual torch.cuda probing).")
+                     "model is eager-loaded onto CPU in the host process (the "
+                     "host never touches CUDA) and moved onto the real GPU "
+                     "inside each @spaces.GPU worker on first generation.")
             os.environ["LLM_DEVICE"] = "cuda"
+
         else:
             try:
                 import torch  # noqa: F811 (already imported above via spaces?)
@@ -163,14 +165,16 @@ def _warmup():
 
       * Dedicated GPU instances (T4, A10G, L4): the GPU is always attached, so
         eager-loading leaves the weights resident before the first user query.
-      * ZeroGPU: HuggingFace recommends placing the model on ``cuda`` at startup
-        so the spaces CUDA-emulation layer can pack the weights ahead of time —
-        each forked @spaces.GPU worker then restores them quickly, keeping the
-        first request fast. (The model load happens in the main process, which
-        is exactly where the emulation can capture/pack it.)
+      * ZeroGPU: the weights are eager-loaded onto **CPU** in this host process
+        (the host must never create a CUDA context, or the forked @spaces.GPU
+        worker dies in ``worker_init`` with "No CUDA GPUs are available"). Each
+        forked worker inherits the CPU weights cheaply (copy-on-write) and moves
+        them onto the real GPU on the first generation, inside the worker, where
+        CUDA is actually available.
 
     Only CPU/MPS-only runtimes fall back to lazy-loading.
     """
+
 
     cfg = flask_app.config
     lazy_load = cfg.get("LLM_LAZY_LOAD", True)
