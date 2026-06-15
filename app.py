@@ -197,9 +197,6 @@ from api.services.structured_output import (  # noqa: E402
     normalize_structured_answer,
     parse_partial_json,
     render_duck_questions,
-    render_fix_options,
-    render_refactor,
-    render_repo_findings,
 )
 
 
@@ -1167,7 +1164,8 @@ GPU_LOAD_DURATION = int(os.getenv("ZEROGPU_LOAD_DURATION", "120"))
 def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
                   temperature: float, stop_on_json: bool = False,
                   prepared_context: str = "",
-                  prepared_sources_json: str = "[]") -> int:
+                  prepared_sources_json: str = "[]",
+                  retrieval_kg_name: str = "") -> int:
     """Reserve more quota only for the (one-off) first call that loads weights."""
     try:
         from api.services.llm_service import get_llm_service
@@ -1182,7 +1180,8 @@ def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
 def _run_generation(message: str, use_context: bool, max_new_tokens: int,
                     temperature: float, stop_on_json: bool = False,
                     prepared_context: str = "",
-                    prepared_sources_json: str = "[]") -> dict:
+                    prepared_sources_json: str = "[]",
+                    retrieval_kg_name: str = "") -> dict:
     """Core generation logic — called directly or wrapped by @spaces.GPU."""
     from api.services.llm_service import get_llm_service
 
@@ -1237,7 +1236,8 @@ else:
 
 
 def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float,
-        stop_on_json: bool = False):
+        stop_on_json: bool = False, retrieval_query: str | None = None,
+        retrieval_kg_name: str | None = None):
     """Submit a prompt through the simple-request workstream.
 
     ``stop_on_json=True`` lets the model stop the moment it has emitted a
@@ -1256,18 +1256,27 @@ def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float
     generation_use_context = bool(use_context)
     prepared_context = ""
     prepared_sources_json = "[]"
+    explicit_retrieval_query = (retrieval_query or "").strip()
+    retrieval_input = explicit_retrieval_query or message
+    requested_kg = (retrieval_kg_name or "").strip()
 
     # Retrieval loads SentenceTransformer/FAISS native libraries. On ZeroGPU,
     # doing that inside the forked @spaces.GPU worker has caused hard segfaults
     # just before LLM generation starts, so prepare KG context in the host and
-    # pass the plain text/sources into the worker.
-    if _SPACES_AVAILABLE and generation_use_context:
+    # pass the plain text/sources into the worker. DuckChat also passes a
+    # focused repo/problem retrieval query so the search is based on the copied
+    # project, not on the JSON schema instructions in the generation prompt.
+    if generation_use_context and (_SPACES_AVAILABLE or explicit_retrieval_query):
         try:
             from api.services.llm_service import get_llm_service
 
             llm = get_llm_service(flask_app.config)
             sources: list[dict]
-            prepared_context, sources = llm.prepare_context(message, True)
+            prepared_context, sources = llm.prepare_context(
+                retrieval_input,
+                True,
+                kg_names=[requested_kg] if requested_kg else None,
+            )
             prepared_sources_json = json.dumps(sources, ensure_ascii=False)
             generation_use_context = False
         except Exception as exc:  # noqa: BLE001
@@ -1290,6 +1299,7 @@ def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float
             stop_on_json,
             prepared_context,
             prepared_sources_json,
+            requested_kg,
         )
 
     except Exception as exc:  # noqa: BLE001
@@ -1646,88 +1656,6 @@ def _get_retrieval_service():
     return get_retrieval_service(flask_app.config)
 
 
-def _repo_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
-    return "\n".join(
-        [
-            "You are Rubber Duck Games, a friendly game development debugging assistant.",
-            "The user wants you to reason from a duplicated Git project, not from a pasted snippet.",
-            "",
-            f"Repository: {(repo or '').strip() or '(not provided)'}",
-            f"Branch: {(branch or '').strip() or 'main'}",
-            f"Local copy: {str(_resolve_destination(destination))}",
-            "",
-            "Observed problem:",
-            (problem or "Help me inspect the project and decide what to test first.").strip(),
-            "",
-            "The duck must return exactly 1 diagnostic question in conversation.messages.",
-            "Respond ONLY with a single JSON object matching this schema (no markdown, no extra text before or after",
-            "the opening/closing braces):",
-            "",
-            "{",
-            '  "schema_version": "1.0",',
-            '  "session": {',
-            '    "mode": "duck_question",',
-            '    "repo": {',
-            '      "url": "<repo url>",',
-            '      "branch": "<branch>",',
-            '      "local_path": "<local path>"',
-            "    },",
-            '    "user_problem": "<one-line summary of the problem>"',
-            "  },",
-            '  "conversation": {',
-            '    "messages": [',
-            "      {",
-            '        "id": "q1",',
-            '        "role": "duck",',
-            '        "kind": "question",',
-            '        "content": "<first diagnostic question>",',
-            '        "intent": "<why you ask this>",',
-            '        "expects_user_reply": true',
-            "      }",
-            "    ],",
-            '    "next_prompt_hint": "<a short hint for what the user could try next>"',
-            "  },",
-            '  "repo_findings": [',
-            "    {",
-            '      "id": "finding_1",',
-            '      "title": "<finding title>",',
-            '      "summary": "<one-sentence finding summary>",',
-            '      "evidence": [',
-            '        {"file": "<relevant file>", "symbol": "<function/class>", "reason": "<why relevant>"}',
-            "      ],",
-            '      "confidence": "low|medium|high",',
-            '      "learning_opportunity": {',
-            '        "concept": "<concept name>",',
-            '        "why_it_matters": "<explanation>",',
-            '        "beginner_explanation": "<beginner-friendly note>",',
-            '        "suggested_next_step": "<concrete next action>"',
-            "      }",
-            "    }",
-            "  ],",
-            '  "fix_options": [',
-            "    {",
-            '      "id": "fix_1",',
-            '      "area": "input|movement|rendering|physics|audio|other",',
-            '      "title": "<fix title>",',
-            '      "description": "<what the fix does>",',
-            '      "complexity": "low|medium|high",',
-            '      "risk": "low|medium|high",',
-            '      "recommended": true,',
-            '      "steps": ["<step 1>", "<step 2>"],',
-            '      "tradeoffs": ["<tradeoff 1>"]',
-            "    }",
-            "  ],",
-            '  "refactor_suggestion": {',
-            '    "title": "<refactor title>",',
-            '    "reason": "<why refactor>",',
-            '    "when_to_do_it": "now|after_fix|later",',
-            '    "scope": "<what files/concepts are affected>"',
-            "  }",
-            "}",
-        ]
-    )
-
-
 def _repo_followup_prompt(repo: str, branch: str, destination: str, problem: str, followup: str) -> str:
     """Build a focused follow-up prompt for the next round of duck questions.
 
@@ -1800,70 +1728,20 @@ def _duck_questions_prompt(repo: str, branch: str, destination: str, problem: st
     )
 
 
-def _repo_findings_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
+def _repo_retrieval_query(repo: str, branch: str, destination: str, problem: str) -> str:
     return "\n".join(
-        _session_header(repo, branch, destination, problem)
-        + [
-            "Return EXACTLY this shape with 1-2 concrete findings grounded in the repo's files:",
+        [
+            f"Repository: {(repo or '').strip() or '(not provided)'}",
+            f"Branch: {(branch or '').strip() or 'main'}",
+            f"Knowledge graph: {_derived_kg_name(repo)}",
+            f"Local copy: {str(_resolve_destination(destination))}",
             "",
-            "{",
-            '  "repo_findings": [',
-            "    {",
-            '      "id": "finding_1",',
-            '      "title": "<finding title>",',
-            '      "summary": "<one-sentence finding summary>",',
-            '      "evidence": [{"file": "<relevant file>", "symbol": "<function/class>", "reason": "<why relevant>"}],',
-            '      "confidence": "low|medium|high",',
-            '      "learning_opportunity": {"concept": "<concept name>", "why_it_matters": "<explanation>", "beginner_explanation": "<beginner-friendly note>", "suggested_next_step": "<concrete next action>"}',
-            "    }",
-            "  ]",
-            "}",
+            "User debugging problem:",
+            (problem or "Help me inspect the project and decide what to test first.").strip(),
+            "",
+            "Retrieve source files, project settings, input mappings, scene scripts, physics code, and nearby symbols relevant to this problem.",
         ]
     )
-
-
-def _fix_options_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
-    return "\n".join(
-        _session_header(repo, branch, destination, problem)
-        + [
-            "Return EXACTLY this shape with 1-2 focused fix options (mark one as recommended):",
-            "",
-            "{",
-            '  "fix_options": [',
-            "    {",
-            '      "id": "fix_1",',
-            '      "area": "input|movement|rendering|physics|audio|other",',
-            '      "title": "<fix title>",',
-            '      "description": "<what the fix does>",',
-            '      "complexity": "low|medium|high",',
-            '      "risk": "low|medium|high",',
-            '      "recommended": true,',
-            '      "steps": ["<step 1>", "<step 2>"],',
-            '      "tradeoffs": ["<tradeoff 1>"]',
-            "    }",
-            "  ]",
-            "}",
-        ]
-    )
-
-
-def _refactor_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
-    return "\n".join(
-        _session_header(repo, branch, destination, problem)
-        + [
-            "Return EXACTLY this shape with a single, small refactor suggestion:",
-            "",
-            "{",
-            '  "refactor_suggestion": {',
-            '    "title": "<refactor title>",',
-            '    "reason": "<why refactor>",',
-            '    "when_to_do_it": "now|after_fix|later",',
-            '    "scope": "<what files/concepts are affected>"',
-            "  }",
-            "}",
-        ]
-    )
-
 
 
 PREVIEW_STRUCTURED_OUTPUT = {
@@ -1890,103 +1768,10 @@ PREVIEW_STRUCTURED_OUTPUT = {
         ],
         "next_prompt_hint": "Try one tiny check first: print the input vector while pressing left and right.",
     },
-    "repo_findings": [
-        {
-            "id": "preview_finding_1",
-            "title": "Movement depends on named input actions",
-            "summary": "The player script appears to read action names, so the Input Map must contain the same names.",
-            "evidence": [
-                {
-                    "file": "player/player.gd",
-                    "symbol": "_physics_process",
-                    "reason": "Reads left/right actions every frame before applying velocity.",
-                },
-                {
-                    "file": "project.godot",
-                    "symbol": "input",
-                    "reason": "This is where Godot stores project-level input action bindings.",
-                },
-            ],
-            "confidence": "high",
-            "learning_opportunity": {
-                "concept": "Input actions",
-                "why_it_matters": "Actions let code ask for intent, like move_left, instead of a specific keyboard key.",
-                "beginner_explanation": "If the action name in code is not registered in the project settings, pressing the key can look like nothing is happening.",
-                "suggested_next_step": "Open Project Settings > Input Map and compare the action names with the player script.",
-            },
-        },
-        {
-            "id": "preview_finding_2",
-            "title": "The update loop may be the right place to test first",
-            "summary": "Movement bugs are easier to isolate when you confirm the frame-by-frame update is actually running.",
-            "evidence": [
-                {
-                    "file": "player/player.gd",
-                    "symbol": "_physics_process",
-                    "reason": "Expected place for physics movement and collision-aware motion.",
-                }
-            ],
-            "confidence": "medium",
-            "learning_opportunity": {
-                "concept": "Game loop debugging",
-                "why_it_matters": "A movement assignment that runs only once will not respond continuously to input.",
-                "beginner_explanation": "Games re-check input many times per second; a single startup check is usually not enough for movement.",
-                "suggested_next_step": "Add one temporary print inside the physics update and verify it repeats while the scene runs.",
-            },
-        },
-    ],
-    "fix_options": [
-        {
-            "id": "preview_fix_1",
-            "area": "input",
-            "title": "Align the Input Map with the player script",
-            "description": "Create or rename the missing actions so the code and project settings use the same names.",
-            "complexity": "low",
-            "risk": "low",
-            "recommended": True,
-            "steps": [
-                "Find the action names read by the player script.",
-                "Add matching actions in Project Settings > Input Map.",
-                "Bind arrow keys or WASD to those actions.",
-                "Run the scene and test one direction at a time.",
-            ],
-            "tradeoffs": [
-                "Smallest change and easiest to verify.",
-                "Does not clean up broader movement structure.",
-            ],
-        },
-        {
-            "id": "preview_fix_2",
-            "area": "movement",
-            "title": "Add a temporary movement trace",
-            "description": "Print the calculated input vector and velocity before changing gameplay code.",
-            "complexity": "low",
-            "risk": "low",
-            "recommended": False,
-            "steps": [
-                "Print the input vector inside the physics update.",
-                "Press each movement key and watch the output.",
-                "Remove the print once the failing step is clear.",
-            ],
-            "tradeoffs": [
-                "Adds temporary noise to the console.",
-                "Helps avoid changing the wrong part of the code.",
-            ],
-        },
-    ],
-    "refactor_suggestion": {
-        "title": "Name movement actions after intent",
-        "reason": "Once movement works, action names like move_left and jump will be easier to scan than engine defaults or key-specific names.",
-        "when_to_do_it": "after_fix",
-        "scope": "Input Map entries and the small section of player movement code that reads them.",
-    },
 }
 
 PREVIEW_STRUCTURED, _ = normalize_structured_answer(json.dumps(PREVIEW_STRUCTURED_OUTPUT))
 PREVIEW_DUCK_QUESTIONS = render_duck_questions(PREVIEW_STRUCTURED)
-PREVIEW_REPO_FINDINGS = render_repo_findings(PREVIEW_STRUCTURED)
-PREVIEW_FIX_OPTIONS = render_fix_options(PREVIEW_STRUCTURED)
-PREVIEW_REFACTOR = render_refactor(PREVIEW_STRUCTURED)
 PREVIEW_RAW_RESPONSE = json.dumps(PREVIEW_STRUCTURED, indent=2)
 
 
@@ -2001,12 +1786,13 @@ def _render_structured_response(raw_answer: str, raw_json: str, repo: str, branc
     )
     raw_payload = json.loads(raw_json) if raw_json and raw_json.strip().startswith("{") else {"raw": raw_json}
     raw_payload["structured_preview_error"] = error
-    raw_payload["structured"] = structured
+    display_structured = dict(structured)
+    display_structured.pop("repo_findings", None)
+    display_structured.pop("fix_options", None)
+    display_structured.pop("refactor_suggestion", None)
+    raw_payload["structured"] = display_structured
     return (
         render_duck_questions(structured),
-        render_repo_findings(structured),
-        render_fix_options(structured),
-        render_refactor(structured),
         json.dumps(raw_payload, indent=2, ensure_ascii=False),
     )
 
@@ -2039,9 +1825,8 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
     Rather than producing the whole schema in a single (slow) call that blocks
     every tab until the end, we ask the model for one small section per call.
     Each call is short — and stops the instant it emits a complete JSON object —
-    so Quacking can render while Repo Findings are still being generated,
-    and so on. This is a Gradio generator: each ``yield`` pushes a fresh set of
-    tab contents to the UI.
+    so DuckChat can render as soon as the model returns a question. This is a
+    Gradio generator: each ``yield`` pushes a fresh tab content update to the UI.
     """
     local_path = str(_resolve_destination(destination))
 
@@ -2067,35 +1852,39 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
         return structured
 
     def _raw(structured: dict) -> str:
-        return json.dumps(structured, indent=2, ensure_ascii=False)
+        display_structured = dict(structured)
+        display_structured.pop("repo_findings", None)
+        display_structured.pop("fix_options", None)
+        display_structured.pop("refactor_suggestion", None)
+        return json.dumps(display_structured, indent=2, ensure_ascii=False)
 
     sections = [
         ("Quacking", _duck_questions_prompt, "duck_questions"),
-        ("Repo Findings", _repo_findings_prompt, "repo_findings"),
-        ("Fix Options", _fix_options_prompt, "fix_options"),
-        ("Refactor", _refactor_prompt, "refactor"),
     ]
+    kg_name = _derived_kg_name(repo)
+    retrieval_query = _repo_retrieval_query(repo, branch, destination, problem)
 
     # Initial frame: everything pending so the user sees immediate feedback.
     pending = {
         "duck_questions": _pending_card("Quacking"),
-        "repo_findings": _pending_card("Repo Findings"),
-        "fix_options": _pending_card("Fix Options"),
-        "refactor": _pending_card("Refactor"),
     }
     yield (
         pending["duck_questions"],
-        pending["repo_findings"],
-        pending["fix_options"],
-        pending["refactor"],
         "{}",
     )
 
     rendered = dict(pending)
     for title, prompt_fn, key in sections:
         prompt = prompt_fn(repo, branch, destination, problem)
-        answer, _ = ask(prompt, use_context, 384, temperature,
-                        stop_on_json=True)
+        answer, _ = ask(
+            prompt,
+            bool(use_context),
+            384,
+            temperature,
+            stop_on_json=True,
+            retrieval_query=retrieval_query if use_context else None,
+            retrieval_kg_name=kg_name if use_context else None,
+        )
         fragment = parse_partial_json(answer)
         if fragment:
             accumulated.update(fragment)
@@ -2104,18 +1893,9 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
         # Refresh the tab that just completed; keep later tabs on their pending
         # placeholders so the user can tell what's still being generated.
         rendered["duck_questions"] = render_duck_questions(structured)
-        if key in ("repo_findings", "fix_options", "refactor"):
-            rendered["repo_findings"] = render_repo_findings(structured)
-        if key in ("fix_options", "refactor"):
-            rendered["fix_options"] = render_fix_options(structured)
-        if key == "refactor":
-            rendered["refactor"] = render_refactor(structured)
 
         yield (
             rendered["duck_questions"],
-            rendered["repo_findings"],
-            rendered["fix_options"],
-            rendered["refactor"],
             _raw(structured),
         )
 
@@ -2178,7 +1958,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                 )
                 status = gr.HTML(value=backend_status(), elem_classes=["backend-status"])
 
-                gr.HTML('<div class="section-label">Project Repository</div>')
                 repo_input = gr.Textbox(
                     label="Repository URL",
                     value="https://github.com/user/platformer-game",
@@ -2206,7 +1985,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                 clone_status = gr.HTML(value=clone_build_progress_html())
 
                 with gr.Accordion("Model options", open=False):
-                    use_context = gr.Checkbox(value=False, label="Use knowledge-graph context")
+                    use_context = gr.Checkbox(value=True, label="Use knowledge-graph context")
                     temperature = gr.Slider(0.0, 1.5, value=0.65, step=0.05, label="Temperature")
 
             with gr.Column(elem_classes=["session-panel"]):
@@ -2240,16 +2019,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                         with gr.Tab("DuckChat", id="duck_questions"):
                             duck_questions = gr.HTML(value=_ask_first_card("Duck Chat"))
 
-                        with gr.Tab("Repo Findings"):
-                            repo_findings = gr.HTML(value=_ask_first_card("Repo Findings"))
-                        with gr.Tab("Fix Options"):
-                            fix_options = gr.HTML(
-                                value=_ask_first_card("Fix Options"),
-                                elem_classes=["structured-panel"],
-                            )
-                        with gr.Tab("Refactor"):
-                            refactor = gr.HTML(value=_ask_first_card("Refactor"))
-
                     with gr.Accordion("Raw response", open=False):
                         raw_json = gr.Code(value="{}", label="JSON", language="json")
 
@@ -2279,7 +2048,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             use_context,
             temperature,
         ],
-        outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
+        outputs=[duck_questions, raw_json],
         show_progress="hidden",
     )
     problem_input.submit(
@@ -2292,7 +2061,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             use_context,
             temperature,
         ],
-        outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
+        outputs=[duck_questions, raw_json],
         show_progress="hidden",
     )
     for component in [repo_input, branch_input]:
