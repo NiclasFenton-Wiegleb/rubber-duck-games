@@ -360,10 +360,15 @@ class LLMService:
 
     # ── Public generation methods ─────────────────────────────────────────────
 
-    def prepare_context(self, query: str, use_context=True) -> tuple[str, list[dict]]:
+    def prepare_context(
+        self,
+        query: str,
+        use_context=True,
+        kg_names: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> tuple[str, list[dict]]:
         """Retrieve KG context for a query without touching the LLM weights."""
         if use_context and self._should_use_context(query):
-            return self._retrieve_context(query)
+            return self._retrieve_context(query, kg_names=kg_names)
         if use_context:
             log.info("Skipping retrieval (heuristic gate): query looks "
                      "conversational/self-contained")
@@ -639,7 +644,11 @@ class LLMService:
                     return False
         return True
 
-    def _retrieve_context(self, query: str) -> tuple[str, list[dict]]:
+    def _retrieve_context(
+        self,
+        query: str,
+        kg_names: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> tuple[str, list[dict]]:
         """
 
         Retrieve the most relevant context across *all* knowledge graphs in the
@@ -652,7 +661,7 @@ class LLMService:
             from api.services.retrieval_service import get_retrieval_service
 
             retrieval = get_retrieval_service(self.config)
-            result = retrieval.retrieve(query)
+            result = retrieval.retrieve(query, kg_names=kg_names)
             return result.get("context", ""), result.get("sources", [])
         except Exception:
             return "", []

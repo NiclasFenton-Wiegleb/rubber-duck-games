@@ -1436,6 +1436,72 @@ def _derived_kg_name(repo: str) -> str:
     return name
 
 
+def _local_symbol_evidence(destination: str, problem: str) -> list[str]:
+    """Return short source snippets for exact symbols named by the user."""
+    import re as _re
+
+    symbols = {
+        token.strip("`")
+        for token in _re.findall(r"`?([A-Za-z_][A-Za-z0-9_]{2,})`?", problem or "")
+        if "_" in token
+    }
+    if not symbols:
+        return []
+
+    root = _resolve_destination(destination)
+    if not root.exists() or not root.is_dir():
+        return []
+
+    skip_dirs = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv"}
+    max_scan_bytes = 256 * 1024
+    snippets: list[str] = []
+    for path in root.rglob("*"):
+        if len(snippets) >= 4:
+            break
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > max_scan_bytes:
+                continue
+        except OSError:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not any(symbol in text for symbol in symbols):
+            continue
+
+        lines = text.splitlines()
+        match_index = next(
+            (idx for idx, line in enumerate(lines) if any(symbol in line for symbol in symbols)),
+            None,
+        )
+        if match_index is None:
+            continue
+        start = max(0, match_index - 6)
+        end = min(len(lines), match_index + 12)
+        rel = path.relative_to(root)
+        body = "\n".join(
+            f"{line_no + 1}: {lines[line_no]}"
+            for line_no in range(start, end)
+        )
+        snippets.append(f"File: {rel}\n{body}")
+
+    if not snippets:
+        return []
+
+    return [
+        "Local symbol evidence from the cloned repository:",
+        *snippets,
+        "",
+        "Use this local evidence before asking for missing context.",
+        "",
+    ]
+
+
 def clone_build_progress_html(
     state: str = "idle",
     detail: str = "",
@@ -1706,6 +1772,14 @@ def _session_header(repo: str, branch: str, destination: str, problem: str) -> l
         "Observed problem:",
         (problem or "Help me inspect the project and decide what to test first.").strip(),
         "",
+        *_local_symbol_evidence(destination, problem),
+        "If reference context is provided and it includes matching files, functions,",
+        "or symbols, use those details directly. Do not ask the user to paste code",
+        "that is already present in the cloned repository context.",
+        "When the observed problem names a function/symbol and the context includes",
+        "that function body, inspect that body first for concrete syntax/runtime clues.",
+        "The question must mention the most relevant file or symbol from context.",
+        "",
         "Respond ONLY with a single JSON object (no markdown, no text before or after the braces).",
     ]
 
@@ -1714,7 +1788,9 @@ def _duck_questions_prompt(repo: str, branch: str, destination: str, problem: st
     return "\n".join(
         _session_header(repo, branch, destination, problem)
         + [
-            "Return EXACTLY this shape with exactly 1 short diagnostic question that guides the developer to find the cause themselves:",
+            "Return EXACTLY this shape with exactly 1 short diagnostic question that guides the developer to find the cause themselves.",
+            "Prefer a question that tests the most suspicious concrete evidence from the repo context over a generic missing-information question.",
+            "If you see an obvious syntax issue, ask whether fixing that exact code changes the error.",
             "",
             "{",
             '  "conversation": {',
@@ -1840,6 +1916,7 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
             "user_problem": problem,
         },
     }
+    retrieval_debug: dict = {}
 
     def _structured() -> dict:
         structured, _ = normalize_structured_answer(
@@ -1856,6 +1933,8 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
         display_structured.pop("repo_findings", None)
         display_structured.pop("fix_options", None)
         display_structured.pop("refactor_suggestion", None)
+        if retrieval_debug:
+            display_structured["retrieval"] = retrieval_debug
         return json.dumps(display_structured, indent=2, ensure_ascii=False)
 
     sections = [
@@ -1876,7 +1955,7 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
     rendered = dict(pending)
     for title, prompt_fn, key in sections:
         prompt = prompt_fn(repo, branch, destination, problem)
-        answer, _ = ask(
+        answer, ask_raw = ask(
             prompt,
             bool(use_context),
             384,
@@ -1885,6 +1964,16 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
             retrieval_query=retrieval_query if use_context else None,
             retrieval_kg_name=kg_name if use_context else None,
         )
+        try:
+            ask_payload = json.loads(ask_raw) if ask_raw.strip().startswith("{") else {}
+        except Exception:  # noqa: BLE001
+            ask_payload = {}
+        retrieval_debug = {
+            "enabled": bool(use_context),
+            "kg_name": kg_name if use_context else None,
+            "context_used": bool(ask_payload.get("context_used")),
+            "sources": ask_payload.get("sources") or [],
+        }
         fragment = parse_partial_json(answer)
         if fragment:
             accumulated.update(fragment)

@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import pickle
+import re
 import threading
 import time
 from collections import Counter
@@ -114,9 +115,14 @@ class RetrievalService:
         self._load_lock = threading.Lock()
 
     # ── Public API ───────────────────────────────────────────────────────────
-    def retrieve(self, query: str, top_k: int | None = None) -> dict:
+    def retrieve(
+        self,
+        query: str,
+        top_k: int | None = None,
+        kg_names: list[str] | set[str] | tuple[str, ...] | None = None,
+    ) -> dict:
         """
-        Return the merged top-k context across all KGs.
+        Return the merged top-k context across selected KGs.
 
         Result: {
             "context": "…merged snippets…",
@@ -125,15 +131,29 @@ class RetrievalService:
         Always returns successfully; an empty context means no KGs / no deps.
         """
         top_k = top_k or self.top_k
+        requested = {name for name in (kg_names or []) if name}
         try:
             self._ensure_loaded()
         except Exception as exc:
             log.warning("Could not load retrieval indexes: %s", exc)
             return {"context": "", "sources": []}
 
-        if not self._kgs:
+        kgs = [
+            kg for kg in (self._kgs or [])
+            if not requested or kg["name"] in requested
+        ]
+        if requested and not kgs:
+            log.warning(
+                "Retrieval: requested KG(s) %s not loaded; available=%s",
+                sorted(requested),
+                [kg["name"] for kg in (self._kgs or [])],
+            )
+
+        if not kgs:
             log.debug("No knowledge graphs available for retrieval")
             return {"context": "", "sources": []}
+
+        lexical_seeds = self._lexical_seeds(query, kgs)
 
         try:
             t0 = time.time()
@@ -141,11 +161,11 @@ class RetrievalService:
             log.debug("Query embedding took %.3fs", time.time() - t0)
         except Exception as exc:
             log.warning("Could not embed query: %s", exc)
-            return {"context": "", "sources": []}
+            return self._context_from_hits(lexical_seeds[:top_k])
 
         # ── Semantic seeds (FAISS, across every KG) ──────────────────────────
         seeds: list[dict] = []
-        for kg in self._kgs:
+        for kg in kgs:
             try:
                 scores, ids = kg["index"].search(q_emb, self.per_kg_k)
             except Exception:
@@ -164,6 +184,19 @@ class RetrievalService:
                     "text": text,
                     "expanded": False,
                 })
+
+        if lexical_seeds:
+            seen = {(h["kg"], h["chunk_id"]) for h in seeds}
+            for hit in lexical_seeds:
+                key = (hit["kg"], hit["chunk_id"])
+                if key in seen:
+                    for seed in seeds:
+                        if (seed["kg"], seed["chunk_id"]) == key:
+                            seed["score"] += 0.35
+                            break
+                    continue
+                seeds.append(hit)
+                seen.add(key)
 
         seeds.sort(key=lambda h: h["score"], reverse=True)
 
@@ -194,13 +227,15 @@ class RetrievalService:
         candidates.sort(key=lambda h: h["score"], reverse=True)
         top = candidates[:top_k]
 
+        return self._context_from_hits(top)
 
+    def _context_from_hits(self, hits: list[dict]) -> dict:
         # Trim each chunk and the merged whole so input length (and therefore
         # prefill time) stays bounded regardless of chunk size.
         parts: list[str] = []
         sources: list[dict] = []
         total = 0
-        for h in top:
+        for h in hits:
             text = self._truncate(h["text"], self.max_chunk_chars)
             snippet = f"[{h['kg']}] {text}"
             if self.max_context_chars > 0 and total + len(snippet) > self.max_context_chars:
@@ -223,6 +258,36 @@ class RetrievalService:
 
         context = "\n\n".join(parts)
         return {"context": context, "sources": sources}
+
+    def _lexical_seeds(self, query: str, kgs: list[dict]) -> list[dict]:
+        """Return high-confidence hits for exact symbols mentioned in the query."""
+        terms = set(re.findall(r"`([^`]+)`", query or ""))
+        terms.update(re.findall(r"[A-Za-z_][A-Za-z0-9_./-]{2,}", query or ""))
+        identifiers = {
+            term.strip()
+            for term in terms
+            if term.strip() and any(ch in term for ch in ("_", "/", "."))
+        }
+        if not identifiers:
+            return []
+
+        hits: list[dict] = []
+        for kg in kgs:
+            for chunk_id, text in kg["chunks"].items():
+                lower_text = text.lower()
+                matches = sum(1 for term in identifiers if term.lower() in lower_text)
+                if not matches:
+                    continue
+                hits.append({
+                    "score": 1.0 + (matches * 0.2),
+                    "kg": kg["name"],
+                    "kg_obj": kg,
+                    "chunk_id": int(chunk_id),
+                    "text": text,
+                    "expanded": False,
+                })
+        hits.sort(key=lambda h: h["score"], reverse=True)
+        return hits
 
     @staticmethod
     def _truncate(text: str, max_chars: int) -> str:
@@ -520,7 +585,10 @@ class RetrievalService:
                     continue
                 try:
                     rec = json.loads(line)
-                    mapping[int(rec["chunk_id"])] = rec["text"]
+                    source = rec.get("source_file") or rec.get("doc_title") or "unknown"
+                    mapping[int(rec["chunk_id"])] = (
+                        f"Source file: {source}\n{rec['text']}"
+                    )
                 except (ValueError, KeyError):
                     continue
         return mapping
