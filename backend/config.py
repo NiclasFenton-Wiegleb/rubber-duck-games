@@ -103,6 +103,30 @@ class Config:
     RETRIEVAL_MIN_SCORE = float(os.getenv("RETRIEVAL_MIN_SCORE", "0.30"))
 
 
+    # ── Knowledge-graph augmented retrieval ─────────────────────────────────
+    # Each KG ships a NetworkX graph (kg/graph.pkl) + an entity→chunk-ids map
+    # (kg/entity_to_chunks.json) alongside its FAISS index. When enabled, the
+    # retrieval service loads those into RAM at startup and uses them to (a)
+    # expand the FAISS seed hits with entity-linked neighbour chunks the vector
+    # search missed and (b) boost chunks that share entities with other strong
+    # hits. All graph ops are in-memory dict/edge lookups (no CUDA, no model),
+    # so query latency stays effectively flat. Master switch — off falls back to
+    # pure vector search (the prior behaviour).
+    KG_EXPANSION_ENABLED = os.getenv("KG_EXPANSION_ENABLED", "true").lower() == "true"
+    # Max entity-linked neighbour chunks pulled in per FAISS seed hit. Keeps the
+    # candidate set (and therefore context size) bounded. 0 disables expansion
+    # while still allowing entity re-ranking.
+    KG_EXPANSION_MAX_NEIGHBORS = int(os.getenv("KG_EXPANSION_MAX_NEIGHBORS", "5"))
+    # Score bonus added per shared entity when re-ranking candidates. Small by
+    # design so semantic (FAISS) similarity stays the dominant signal. 0 disables
+    # entity re-ranking.
+    KG_ENTITY_BOOST = float(os.getenv("KG_ENTITY_BOOST", "0.05"))
+    # Cap on the total bonus a single chunk can accrue from shared entities, so a
+    # heavily-connected hub chunk can't dominate purely on connectivity.
+    KG_ENTITY_BOOST_CAP = float(os.getenv("KG_ENTITY_BOOST_CAP", "0.20"))
+
+
+
     # ── Prompting ───────────────────────────────────────────────────────────
     # Local text file holding the system prompt prepended to every query.
     SYSTEM_PROMPT_PATH = os.getenv(
