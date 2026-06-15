@@ -1493,13 +1493,65 @@ def _local_symbol_evidence(destination: str, problem: str) -> list[str]:
     if not snippets:
         return []
 
+    evidence_text = "\n\n".join(snippets)
+    callable_hints = _local_callable_hints(root, evidence_text)
+
     return [
         "Local symbol evidence from the cloned repository:",
         *snippets,
+        *callable_hints,
         "",
         "Use this local evidence before asking for missing context.",
         "",
     ]
+
+
+def _local_callable_hints(root: Path, evidence_text: str) -> list[str]:
+    """Highlight likely misspelled method calls found in local evidence."""
+    import difflib
+    import re as _re
+
+    calls = {
+        name
+        for _, name in _re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", evidence_text)
+        if name
+    }
+    if not calls:
+        return []
+
+    functions: dict[str, list[str]] = {}
+    skip_dirs = {".git", ".hg", ".svn", "__pycache__", "node_modules", ".venv", "venv"}
+    max_scan_bytes = 256 * 1024
+    for path in root.rglob("*"):
+        if any(part in skip_dirs for part in path.parts) or not path.is_file():
+            continue
+        try:
+            if path.stat().st_size > max_scan_bytes:
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in _re.finditer(r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text, _re.MULTILINE):
+            functions.setdefault(match.group(1), []).append(str(path.relative_to(root)))
+
+    if not functions:
+        return []
+
+    hints: list[str] = []
+    for call in sorted(calls):
+        if call in functions:
+            continue
+        close = difflib.get_close_matches(call, functions.keys(), n=1, cutoff=0.72)
+        if close:
+            target = close[0]
+            hints.append(
+                f"Callable check: no local `func {call}(` was found; did you mean "
+                f"`func {target}(` in {', '.join(functions[target][:2])}?"
+            )
+
+    if not hints:
+        return []
+    return ["", "Local callable checks:", *hints]
 
 
 def clone_build_progress_html(
@@ -1738,6 +1790,10 @@ def _repo_followup_prompt(repo: str, branch: str, destination: str, problem: str
             "Their latest reply or observation:",
             (followup or "").strip(),
             "",
+            "Do not ask what the user expected or what happened if the observed",
+            "problem already says that. Use the repo evidence to ask a more specific",
+            "question about a concrete file, symbol, or call.",
+            "",
             "Based on that reply, return EXACTLY this shape with exactly 1 short, updated",
             "diagnostic question that guides the user closer to the cause:",
             "",
@@ -1779,6 +1835,8 @@ def _session_header(repo: str, branch: str, destination: str, problem: str) -> l
         "When the observed problem names a function/symbol and the context includes",
         "that function body, inspect that body first for concrete syntax/runtime clues.",
         "The question must mention the most relevant file or symbol from context.",
+        "Do not ask what behavior was expected or what happened if the observed",
+        "problem already includes expected and actual behavior.",
         "",
         "Respond ONLY with a single JSON object (no markdown, no text before or after the braces).",
     ]
@@ -1791,6 +1849,7 @@ def _duck_questions_prompt(repo: str, branch: str, destination: str, problem: st
             "Return EXACTLY this shape with exactly 1 short diagnostic question that guides the developer to find the cause themselves.",
             "Prefer a question that tests the most suspicious concrete evidence from the repo context over a generic missing-information question.",
             "If you see an obvious syntax issue, ask whether fixing that exact code changes the error.",
+            "If a method call has no matching local function but has a close spelling match, ask about that mismatch.",
             "",
             "{",
             '  "conversation": {',
