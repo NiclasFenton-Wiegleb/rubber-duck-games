@@ -31,7 +31,7 @@ A friendly AI-powered rubber duck debugger built for hobby game developers. Inst
    `/api/knowledge-graph/build`, `/health`).
 3. **Warms up** the system prompt (from `backend/prompts/system_prompt.txt`), the
    knowledge-graph retrieval indexes (read from `/data`), and the small language
-   model (onto the GPU). Flask runs in the *same* process, so these singletons are
+   model (onto the GPU). Flask runs in the _same_ process, so these singletons are
    shared with the API handlers.
 4. **Serves a minimal Gradio UI** — a single text box that submits prompts through
    the "simple request" workstream by calling the local Flask API.
@@ -51,8 +51,8 @@ python -m spacy download en_core_web_sm   # only needed for KG building
 python app.py
 ```
 
-- Gradio UI:   http://127.0.0.1:7860
-- Flask API:   http://127.0.0.1:5000  (health: `GET /health`)
+- Gradio UI: http://127.0.0.1:7860
+- Flask API: http://127.0.0.1:5000 (health: `GET /health`)
 
 The UI shows a live **status line** (backend up? model loaded? device? which KGs
 were found?) and a **Raw response (debug)** panel with the full JSON returned by
@@ -69,13 +69,17 @@ curl -X POST http://127.0.0.1:5000/api/query \
 
 Useful environment overrides (see `backend/config.py`):
 
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `KG_STORAGE_DIR` | Root holding the KG subfolders | `/data` (or `backend/artifacts`) |
-| `LLM_DEVICE` | `cuda` / `cpu` / `auto` | auto-detected |
-| `LLM_LAZY_LOAD` | Load model on first request instead of startup | `false` in the Space |
-| `RETRIEVAL_TOP_K` | Chunks kept in the merged context | `4` |
-| `SYSTEM_PROMPT_PATH` | System prompt text file | `backend/prompts/system_prompt.txt` |
+| Variable             | Purpose                                        | Default                             |
+| -------------------- | ---------------------------------------------- | ----------------------------------- |
+| `KG_STORAGE_DIR`     | Root holding the KG subfolders                 | `/data` (or `backend/artifacts`)    |
+| `LLM_DEVICE`         | `cuda` / `cpu` / `auto`                        | auto-detected                       |
+| `LLM_LAZY_LOAD`      | Load model on first request instead of startup | `false` in the Space                |
+| `RETRIEVAL_TOP_K`    | Chunks kept in the merged context              | `4`                                 |
+| `SYSTEM_PROMPT_PATH` | System prompt text file                        | `backend/prompts/system_prompt.txt` |
+
+## Demo Video
+
+- Access the video [here](https://drive.google.com/file/d/1OX5-tTXuQBmyLKD0GtjE7jndCa5uXplD/view?usp=sharing)
 
 ## What it does
 
@@ -87,7 +91,7 @@ Useful environment overrides (see `backend/config.py`):
 ## Who it's for
 
 Hobby game developers of any skill level who want to get unstuck without losing the
-learning experience, understand *why* something isn't working, and pick up good
+learning experience, understand _why_ something isn't working, and pick up good
 habits around code structure, debugging, and problem-solving.
 
 ## Tips for best results
