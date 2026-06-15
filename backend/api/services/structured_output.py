@@ -355,15 +355,13 @@ def render_duck_questions(structured: dict[str, Any]) -> str:
     for message in messages:
         role = _clean_text(message.get("role"), "duck")
         avatar = "You" if role == "user" else "D"
-        kicker = "You" if role == "user" else f"Duck - {_clean_text(message.get('kind'), 'question')}"
-        reply_tag = '<span class="tag tag-green">reply helpful</span>' if message.get("expects_user_reply") else ""
+        kicker = "You" if role == "user" else f"Duck"
         lines.append(
             '<div class="chat-line">'
             f'<div class="avatar">{html.escape(avatar)}</div>'
             '<div class="chat-card">'
             f'<div class="card-kicker">{html.escape(kicker)}</div>'
             f'<p>{html.escape(_clean_text(message.get("content")))}</p>'
-            f'{reply_tag}'
             '</div>'
             '</div>'
         )
