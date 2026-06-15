@@ -12,11 +12,22 @@ pinned: false
 suggested_hardware: t4-small
 suggested_storage: small
 short_description: A friendly AI rubber-duck debugger for hobby game devs.
+tags:
+  - build-small-hackathon
+  - game-dev
+  - debugging
+  - small-models
+  - off-the-grid
+  - off-brand
+  - well-tuned
+  - field-notes
 ---
 
 # 🦆 Game Dev Rubber Duck
 
-A friendly AI-powered rubber duck debugger built for hobby game developers. Instead of just handing you the answer, it helps you think through your problem yourself — asking the right questions, nudging you toward best practices, and cheering you on as you figure it out.
+A friendly AI-powered rubber duck debugger built for hobby game developers. Give it a game repo and a bug report; it clones the project, builds a knowledge graph over the copied source, and asks one focused debugging question grounded in the actual code.
+
+Built by Liam Curran and Niclas FW for the Build Small Hackathon.
 
 ## How the Space runs
 
@@ -33,8 +44,8 @@ A friendly AI-powered rubber duck debugger built for hobby game developers. Inst
    knowledge-graph retrieval indexes (read from `/data`), and the small language
    model (onto the GPU). Flask runs in the _same_ process, so these singletons are
    shared with the API handlers.
-4. **Serves a minimal Gradio UI** — a single text box that submits prompts through
-   the "simple request" workstream by calling the local Flask API.
+4. **Serves a Gradio UI** — clone a repo, build a project knowledge graph, and
+   ask DuckChat for a focused debugging question grounded in that copied code.
 
 > **Persistent storage must be enabled** on the Space for `/data` to be mounted.
 > Each knowledge graph lives in its own subfolder, e.g. `/data/godot-docs/…`,
@@ -81,21 +92,35 @@ Useful environment overrides (see `backend/config.py`):
 
 - Access the video [here](https://drive.google.com/file/d/1OX5-tTXuQBmyLKD0GtjE7jndCa5uXplD/view?usp=sharing)
 
+## Hackathon Post
+
+- Read the post [here](TODO_ADD_POST_LINK)
+
+## Hackathon Badges
+
+We are submitting for the following Build Small extra-point badges:
+
+- **Off the Grid** — the app uses a small, focused model instead of relying on a huge general-purpose assistant.
+- **Off-Brand** — the product is playful and domain-specific: a game-dev rubber duck rather than a generic coding chatbot.
+- **Well-Tuned** — DuckChat returns one constrained, structured question at a time so the experience stays fast and focused.
+- **Field Notes** — the app includes debug JSON, retrieval sources, and project context so users can see how the duck reached its question.
+
 ## What it does
 
-- **Rubber duck debugging** — talk through your code problem and the duck helps you reason through it step by step.
-- **Beginner-friendly** — clear, approachable explanations for hobbyists.
-- **Teaches as you go** — surfaces relevant concepts and best practices in context.
-- **Stays in your corner** — guides you to the "aha!" moment rather than dumping a solution.
+- **Clones a game repo** — bring in a Godot, Unity, pygame, or other hobby game project without pasting snippets by hand.
+- **Builds project context** — chunks source files, builds a knowledge graph, and retrieves relevant files/functions for the bug report.
+- **Asks one useful question** — DuckChat keeps the debugging loop small by returning a single focused question instead of a wall of fixes.
+- **Shows its work** — the raw JSON panel includes retrieval status and sources so users can tell when the answer is grounded in repo context.
 
 ## Who it's for
 
-Hobby game developers of any skill level who want to get unstuck without losing the
-learning experience, understand _why_ something isn't working, and pick up good
-habits around code structure, debugging, and problem-solving.
+Hobby game developers of any skill level who want to get unstuck without losing
+the learning experience. It is especially useful for beginners who have a whole
+project, not a perfectly isolated snippet, and need help deciding what to inspect
+first.
 
 ## Tips for best results
 
-- Share the relevant snippet of code, not your whole project.
-- Describe what you've already tried, and expected vs. actual behaviour.
-- Mention your engine/language (Unity/C#, Godot/GDScript, pygame, etc.).
+- Use a public repo or fork that the Space can clone.
+- Describe what failed, what you expected, and any function, scene, script, or error name you saw.
+- Rebuild the knowledge graph after changing branches or pushing a new demo bug.
