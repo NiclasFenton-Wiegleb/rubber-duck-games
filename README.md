@@ -94,7 +94,7 @@ Useful environment overrides (see `backend/config.py`):
 
 ## Hackathon Post
 
-- Read the post [here](TODO_ADD_POST_LINK)
+- Read the post [here](https://www.linkedin.com/feed/update/urn:li:share:7472390515846582272/)
 
 ## Hackathon Badges
 
