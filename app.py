@@ -30,7 +30,15 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"resource_tracker: There appear to be .* leaked semaphore objects to clean up at shutdown",
+    category=UserWarning,
+    module=r"multiprocessing\.resource_tracker",
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -849,6 +857,183 @@ APP_CSS = """
     font-weight: 800 !important;
 }
 
+.build-progress {
+    background: #ffffff;
+    border: 1px solid #cfd9e5;
+    border-radius: 8px;
+    color: #172033;
+    display: grid;
+    gap: 12px;
+    margin: 0;
+    padding: 12px;
+}
+
+.build-progress.is-idle {
+    display: none;
+}
+
+.build-progress.is-loading {
+    background: #fff8df;
+    border-color: #d7aa2c;
+}
+
+.build-progress.is-success {
+    background: #e9f8f4;
+    border-color: #82cdbf;
+}
+
+.build-progress.is-error {
+    background: #fff0f0;
+    border-color: #e19494;
+}
+
+.build-progress-head {
+    align-items: flex-start;
+    display: flex;
+    gap: 10px;
+}
+
+.build-spinner {
+    animation: rdg-spin 0.9s linear infinite;
+    border: 3px solid rgba(128, 83, 10, 0.24);
+    border-top-color: #d9480f;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    height: 19px;
+    margin-top: 1px;
+    width: 19px;
+}
+
+.build-progress.is-success .build-spinner,
+.build-progress.is-error .build-spinner {
+    animation: none;
+    border: 2px solid currentColor;
+    border-radius: 50%;
+    color: currentColor;
+    display: grid;
+    height: 19px;
+    place-items: center;
+    width: 19px;
+}
+
+.build-progress.is-success .build-spinner::before {
+    border-bottom: 2px solid currentColor;
+    border-left: 2px solid currentColor;
+    content: "";
+    height: 4px;
+    transform: rotate(-45deg) translate(1px, -1px);
+    width: 8px;
+}
+
+.build-progress.is-error .build-spinner::before {
+    content: "!";
+    font-size: 12px;
+    font-weight: 900;
+    line-height: 1;
+}
+
+.build-progress-title {
+    color: #111827;
+    font-size: 13px;
+    font-weight: 850;
+    line-height: 1.25;
+}
+
+.build-progress-detail {
+    color: #2d3c50;
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.45;
+    margin-top: 2px;
+}
+
+.build-meta {
+    background: rgba(255, 255, 255, 0.68);
+    border: 1px solid rgba(64, 81, 106, 0.16);
+    border-radius: 6px;
+    display: grid;
+    gap: 7px;
+    padding: 9px;
+}
+
+.build-meta-row {
+    display: grid;
+    gap: 3px;
+}
+
+.build-meta-label {
+    color: #40516a;
+    font-size: 10px;
+    font-weight: 850;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.build-meta-value {
+    color: #172033;
+    font-size: 12px;
+    font-weight: 750;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+}
+
+.build-path {
+    background: #172033;
+    border-radius: 5px;
+    color: #ffffff;
+    display: block;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-size: 12px;
+    font-weight: 750;
+    line-height: 1.35;
+    padding: 7px 8px;
+    white-space: normal;
+    word-break: break-word;
+}
+
+.build-steps {
+    display: grid;
+    gap: 6px;
+}
+
+.build-step {
+    align-items: center;
+    color: #40516a;
+    display: flex;
+    font-size: 12px;
+    font-weight: 750;
+    gap: 8px;
+}
+
+.build-step-dot {
+    background: #aebdcb;
+    border-radius: 50%;
+    flex: 0 0 auto;
+    height: 8px;
+    width: 8px;
+}
+
+.build-step.done {
+    color: #0b5f58;
+}
+
+.build-step.done .build-step-dot {
+    background: #0f8f80;
+}
+
+.build-step.active {
+    color: #7a4300;
+}
+
+.build-step.active .build-step-dot {
+    background: #d9480f;
+    box-shadow: 0 0 0 4px rgba(217, 72, 15, 0.16);
+}
+
+@keyframes rdg-spin {
+    to { transform: rotate(360deg); }
+}
+
 .compact-input textarea,
 .compact-input input {
     font-size: 13px !important;
@@ -1119,15 +1304,20 @@ def fetch_branches(repo: str):
     return gr.update(choices=branches, value=preferred)
 
 
-def clone_project(repo: str, branch: str, destination: str):
+def clone_project(repo: str, branch: str, destination: str) -> dict:
     repo = (repo or "").strip()
     branch = (branch or "").strip()
     if not repo:
-        return "Missing repository path or URL."
+        return {"ok": False, "message": "Missing repository path or URL.", "path": "", "reused": False}
 
     dest = _resolve_destination(destination)
     if dest.exists() and any(dest.iterdir()):
-        return f"Using existing copy at `{dest}`."
+        return {
+            "ok": True,
+            "message": "Using existing local copy.",
+            "path": str(dest),
+            "reused": True,
+        }
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     clone_cmd = ["git", "clone", "--depth", "1"]
@@ -1138,13 +1328,13 @@ def clone_project(repo: str, branch: str, destination: str):
     try:
         code, output = _run_command(clone_cmd, timeout=180)
     except Exception as exc:  # noqa: BLE001 - surface setup issue to the UI
-        return f"Clone failed: `{exc}`"
+        return {"ok": False, "message": f"Clone failed: {exc}", "path": str(dest), "reused": False}
 
     if code != 0:
         detail = output.splitlines()[-1] if output else "No output returned."
-        return f"Clone failed: `{detail}`"
+        return {"ok": False, "message": f"Clone failed: {detail}", "path": str(dest), "reused": False}
 
-    return f"Cloned to `{dest}`."
+    return {"ok": True, "message": "Cloned repository.", "path": str(dest), "reused": False}
 
 
 def _derived_kg_name(repo: str) -> str:
@@ -1161,22 +1351,120 @@ def _derived_kg_name(repo: str) -> str:
     return name
 
 
-def clone_and_build_project(repo: str, branch: str, destination: str):
-    """Clone a repo, then automatically build its Knowledge Graph locally.
+def clone_build_progress_html(
+    state: str = "idle",
+    detail: str = "",
+    active_step: str = "clone",
+    title: str | None = None,
+    repo_path: str = "",
+    kg_name: str = "",
+    stats: dict | None = None,
+) -> str:
+    steps = [("clone", "Prepare repository"), ("kg", "Build knowledge graph")]
+    step_html = []
+    for key, label in steps:
+        if state == "success" or (active_step == "kg" and key == "clone"):
+            status = "done"
+        elif state == "error" and active_step == "kg" and key == "clone":
+            status = "done"
+        elif key == active_step and state == "loading":
+            status = "active"
+        else:
+            status = ""
+        step_html.append(
+            f'<div class="build-step {status}"><span class="build-step-dot"></span>{html.escape(label)}</div>'
+        )
 
-    Returns (clone_status_text, kg_status_text).
-    """
-    # ── Step 1: Clone ───────────────────────────────────────────────────
-    clone_msg = clone_project(repo, branch, destination)
-    if "failed" in clone_msg.lower():
-        return clone_msg, f"KG build skipped — {clone_msg}"
+    titles = {
+        "idle": "",
+        "loading": "Preparing project",
+        "success": "Project ready",
+        "error": "Build needs attention",
+    }
+    meta_rows = []
+    if repo_path:
+        meta_rows.append(
+            '<div class="build-meta-row">'
+            '<div class="build-meta-label">Local copy</div>'
+            f'<code class="build-path">{html.escape(repo_path)}</code>'
+            '</div>'
+        )
+    if kg_name:
+        meta_rows.append(
+            '<div class="build-meta-row">'
+            '<div class="build-meta-label">Knowledge graph</div>'
+            f'<div class="build-meta-value">{html.escape(kg_name)}</div>'
+            '</div>'
+        )
+    if stats:
+        stats_text = (
+            f"{stats.get('chunks', '?')} chunks, "
+            f"{stats.get('nodes', '?')} nodes, "
+            f"{stats.get('edges', '?')} edges"
+        )
+        meta_rows.append(
+            '<div class="build-meta-row">'
+            '<div class="build-meta-label">Indexed</div>'
+            f'<div class="build-meta-value">{html.escape(stats_text)}</div>'
+            '</div>'
+        )
+
+    safe_state = html.escape(state)
+    safe_detail = html.escape(detail)
+    safe_title = html.escape(title or titles.get(state, titles["loading"]))
+    meta_html = f'<div class="build-meta">{"".join(meta_rows)}</div>' if meta_rows else ""
+    return (
+        f'<div class="build-progress is-{safe_state}" role="status" aria-live="polite">'
+        '<div class="build-progress-head">'
+        '<span class="build-spinner" aria-hidden="true"></span>'
+        '<div>'
+        f'<div class="build-progress-title">{safe_title}</div>'
+        f'<div class="build-progress-detail">{safe_detail}</div>'
+        '</div>'
+        '</div>'
+        f'{meta_html}'
+        f'<div class="build-steps">{"".join(step_html)}</div>'
+        '</div>'
+    )
+
+
+def clone_and_build_project(repo: str, branch: str, destination: str):
+    yield clone_build_progress_html(
+        "loading",
+        "Step 1 of 2: checking the destination and cloning the selected branch if needed.",
+        "clone",
+        title="Preparing repository",
+    )
+
+    clone_result = clone_project(repo, branch, destination)
+    if not clone_result["ok"]:
+        yield clone_build_progress_html(
+            "error",
+            clone_result["message"],
+            "clone",
+            repo_path=clone_result.get("path", ""),
+        )
+        return
 
     dest = _resolve_destination(destination)
     kg_name = _derived_kg_name(repo)
     log.info("Auto-building KG for cloned repo. repo=%s, dest=%s, kg_name=%s",
              repo[:80], dest, kg_name)
 
-    # ── Step 2: Trigger KG build via local backend API ──────────────────
+    clone_detail = (
+        "Found an existing local copy, so cloning was skipped. "
+        if clone_result["reused"]
+        else "Repository cloned successfully. "
+    )
+    yield clone_build_progress_html(
+        "loading",
+        clone_detail + "Step 2 of 2: scanning files, chunking source, and creating graph links. This can take a few minutes.",
+        "kg",
+        title="Building knowledge graph",
+        repo_path=clone_result["path"],
+        kg_name=kg_name,
+    )
+
     try:
         resp = requests.post(
             f"{BACKEND_URL}/api/knowledge-graph/build",
@@ -1186,31 +1474,52 @@ def clone_and_build_project(repo: str, branch: str, destination: str):
         if resp.status_code == 200:
             data = resp.json()
             stats = data.get("stats", {})
-            chunks = stats.get("chunks", "?")
-            msg = (
-                f"Knowledge Graph built: **{kg_name}** "
-                f"({chunks} chunks, {stats.get('nodes', '?')} nodes, "
-                f"{stats.get('edges', '?')} edges)"
-            )
-            log.info("KG build succeeded: %s", msg)
-            # Update global STATE so the UI status chip reflects the new KG.
+            log.info("KG build succeeded: %s", stats)
             try:
                 retrieval = _get_retrieval_service()
                 retrieval.refresh()
                 STATE["kgs"] = retrieval.kg_names
             except Exception:
                 pass
-            return clone_msg, msg
+            final_title = "Existing copy indexed" if clone_result["reused"] else "Repo cloned and indexed"
+            final_detail = "The knowledge graph is ready. You can ask the duck about this project now."
+            yield clone_build_progress_html(
+                "success",
+                final_detail,
+                "kg",
+                title=final_title,
+                repo_path=clone_result["path"],
+                kg_name=kg_name,
+                stats=stats,
+            )
         else:
             err = resp.text[:500]
             log.warning("KG build returned HTTP %d: %s", resp.status_code, err)
-            return clone_msg, f"KG build failed — HTTP {resp.status_code}: {err}"
+            yield clone_build_progress_html(
+                "error",
+                f"The backend returned HTTP {resp.status_code}: {err}",
+                "kg",
+                repo_path=clone_result["path"],
+                kg_name=kg_name,
+            )
     except requests.exceptions.ConnectionError:
         log.warning("KG build: backend not reachable at %s", BACKEND_URL)
-        return clone_msg, "KG build failed — backend not reachable."
+        yield clone_build_progress_html(
+            "error",
+            "The backend is not reachable, so the knowledge graph could not be built.",
+            "kg",
+            repo_path=clone_result["path"],
+            kg_name=kg_name,
+        )
     except Exception as exc:  # noqa: BLE001
         log.exception("KG build failed: %s", exc)
-        return clone_msg, f"KG build failed — {exc}"
+        yield clone_build_progress_html(
+            "error",
+            f"Knowledge graph build failed: {exc}",
+            "kg",
+            repo_path=clone_result["path"],
+            kg_name=kg_name,
+        )
 
 
 def _get_retrieval_service():
@@ -1633,6 +1942,14 @@ def _pending_card(title: str) -> str:
     )
 
 
+def _ask_first_card(title: str) -> str:
+    return (
+        f'<div class="info-card"><div class="card-kicker">{html.escape(title)}</div>'
+        'Ask a question to get some feedback.'
+        '</div>'
+    )
+
+
 def ask_repo(repo: str, branch: str, destination: str, problem: str,
              use_context: bool, temperature: float):
     """Generate the duck session one tab at a time and stream each as it's ready.
@@ -1792,10 +2109,8 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                 )
 
                 destination_input = gr.State("./runs/duck-repo-copy")
-                clone_status = gr.Markdown("")
-                kg_status = gr.Markdown("")
-
                 clone_button = gr.Button("Clone Repo & Build KG", variant="primary", elem_classes=["primary-duck"])
+                clone_status = gr.HTML(value=clone_build_progress_html())
 
                 with gr.Accordion("Model options", open=False):
                     use_context = gr.Checkbox(value=True, label="Use knowledge-graph context")
@@ -1824,35 +2139,25 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
 
                     with gr.Tabs(selected="duck_questions"):
                         with gr.Tab("Duck Questions", id="duck_questions"):
-                            duck_questions = gr.HTML(value=PREVIEW_DUCK_QUESTIONS)
-                            followup_input = gr.Textbox(
-                                label="Continue the conversation",
-                                placeholder="e.g. I printed the vector and it stays (0, 0) when I press left.",
-                                lines=2,
-                                elem_classes=["compact-input"],
-                            )
-                            followup_submit = gr.Button(
-                                "Reply to the duck",
-                                variant="primary",
-                                elem_classes=["primary-duck"],
-                            )
+                            duck_questions = gr.HTML(value=_ask_first_card("Duck Questions"))
+
                         with gr.Tab("Repo Findings"):
-                            repo_findings = gr.HTML(value=PREVIEW_REPO_FINDINGS)
+                            repo_findings = gr.HTML(value=_ask_first_card("Repo Findings"))
                         with gr.Tab("Fix Options"):
                             fix_options = gr.HTML(
-                                value=PREVIEW_FIX_OPTIONS,
+                                value=_ask_first_card("Fix Options"),
                                 elem_classes=["structured-panel"],
                             )
                         with gr.Tab("Refactor"):
-                            refactor = gr.HTML(value=PREVIEW_REFACTOR)
+                            refactor = gr.HTML(value=_ask_first_card("Refactor"))
 
                     with gr.Accordion("Raw response", open=False):
-                        raw_json = gr.Code(value=PREVIEW_RAW_RESPONSE, label="JSON", language="json")
+                        raw_json = gr.Code(value="{}", label="JSON", language="json")
 
     clone_button.click(
         clone_and_build_project,
         inputs=[repo_input, branch_input, destination_input],
-        outputs=[clone_status, kg_status],
+        outputs=clone_status,
     )
     fetch_branches_button.click(
         fetch_branches,
@@ -1887,32 +2192,6 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             temperature,
         ],
         outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
-    )
-    followup_submit.click(
-        continue_repo_conversation,
-        inputs=[
-            repo_input,
-            branch_input,
-            destination_input,
-            problem_input,
-            followup_input,
-            use_context,
-            temperature,
-        ],
-        outputs=[duck_questions, followup_input],
-    )
-    followup_input.submit(
-        continue_repo_conversation,
-        inputs=[
-            repo_input,
-            branch_input,
-            destination_input,
-            problem_input,
-            followup_input,
-            use_context,
-            temperature,
-        ],
-        outputs=[duck_questions, followup_input],
     )
     for component in [repo_input, branch_input]:
         component.change(
