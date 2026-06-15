@@ -124,7 +124,27 @@ class StructuredOutputTests(unittest.TestCase):
         html = render_duck_questions(structured)
 
         self.assertIn("What happens when you press jump?", html)
-        self.assertIn("Try one input at a time.", html)
+        self.assertEqual(structured["conversation"]["next_prompt_hint"], "Try one input at a time.")
+        self.assertNotIn("Try one input at a time.", html)
+        self.assertNotIn("Next", html)
+
+    def test_duck_questions_are_capped_at_one(self):
+        structured, _ = normalize_structured_answer(
+            json.dumps(
+                {
+                    "conversation": {
+                        "messages": [
+                            {"id": "q1", "role": "duck", "kind": "question", "content": "Question one?"},
+                            {"id": "q2", "role": "duck", "kind": "question", "content": "Question two?"},
+                            {"id": "q3", "role": "duck", "kind": "question", "content": "Question three?"},
+                        ],
+                    }
+                }
+            )
+        )
+
+        messages = structured["conversation"]["messages"]
+        self.assertEqual([message["content"] for message in messages], ["Question one?"])
 
     def test_repo_findings_render_learning_opportunity(self):
         structured, _ = normalize_structured_answer(

@@ -706,6 +706,28 @@ APP_CSS = """
     line-height: 1.45;
 }
 
+.loading-card {
+    align-items: flex-start;
+    display: flex;
+    gap: 10px;
+}
+
+.loading-card .build-spinner {
+    margin-top: 1px;
+}
+
+.loading-card-body {
+    display: grid;
+    gap: 4px;
+}
+
+.loading-card-text {
+    color: #243247 !important;
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.45;
+}
+
 .info-card ul,
 .info-card ol {
     margin: 8px 0 10px 20px;
@@ -1637,6 +1659,7 @@ def _repo_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
             "Observed problem:",
             (problem or "Help me inspect the project and decide what to test first.").strip(),
             "",
+            "The duck must return exactly 1 diagnostic question in conversation.messages.",
             "Respond ONLY with a single JSON object matching this schema (no markdown, no extra text before or after",
             "the opening/closing braces):",
             "",
@@ -1659,24 +1682,6 @@ def _repo_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
             '        "kind": "question",',
             '        "content": "<first diagnostic question>",',
             '        "intent": "<why you ask this>",',
-            '        "expects_user_reply": true',
-            "      },",
-            "      {",
-            '        "id": "q2", "role": "duck", "kind": "question",',
-            '        "content": "<second question>",',
-            '        "intent": "<intent>",',
-            '        "expects_user_reply": true',
-            "      },",
-            "      {",
-            '        "id": "q3", "role": "duck", "kind": "question",',
-            '        "content": "<third question>",',
-            '        "intent": "<intent>",',
-            '        "expects_user_reply": true',
-            "      },",
-            "      {",
-            '        "id": "q4", "role": "duck", "kind": "question",',
-            '        "content": "<fourth question>",',
-            '        "intent": "<intent>",',
             '        "expects_user_reply": true',
             "      }",
             "    ],",
@@ -1726,7 +1731,7 @@ def _repo_prompt(repo: str, branch: str, destination: str, problem: str) -> str:
 def _repo_followup_prompt(repo: str, branch: str, destination: str, problem: str, followup: str) -> str:
     """Build a focused follow-up prompt for the next round of duck questions.
 
-    The follow-up only needs to refresh the Duck Questions section, so we reuse
+    The follow-up only needs to refresh the Quacking section, so we reuse
     the small, single-section schema (the same one the initial flow uses) rather
     than asking the model to re-emit the entire session. Requesting the full
     schema here overflows the short token budget, truncates the JSON, and breaks
@@ -1739,16 +1744,13 @@ def _repo_followup_prompt(repo: str, branch: str, destination: str, problem: str
             "Their latest reply or observation:",
             (followup or "").strip(),
             "",
-            "Based on that reply, return EXACTLY this shape with up to 4 short, updated",
-            "diagnostic questions that guide the user closer to the cause:",
+            "Based on that reply, return EXACTLY this shape with exactly 1 short, updated",
+            "diagnostic question that guides the user closer to the cause:",
             "",
             "{",
             '  "conversation": {',
             '    "messages": [',
-            '      {"id": "q1", "role": "duck", "kind": "question", "content": "<first diagnostic question>", "intent": "<why you ask this>", "expects_user_reply": true},',
-            '      {"id": "q2", "role": "duck", "kind": "question", "content": "<second question>", "intent": "<intent>", "expects_user_reply": true},',
-            '      {"id": "q3", "role": "duck", "kind": "question", "content": "<third question>", "intent": "<intent>", "expects_user_reply": true},',
-            '      {"id": "q4", "role": "duck", "kind": "question", "content": "<fourth question>", "intent": "<intent>", "expects_user_reply": true}',
+            '      {"id": "q1", "role": "duck", "kind": "question", "content": "<diagnostic question>", "intent": "<why you ask this>", "expects_user_reply": true}',
             "    ],",
             '    "next_prompt_hint": "<a short hint for what the user could try next>"',
             "  }",
@@ -1784,16 +1786,12 @@ def _duck_questions_prompt(repo: str, branch: str, destination: str, problem: st
     return "\n".join(
         _session_header(repo, branch, destination, problem)
         + [
-            "Return EXACTLY this shape with up to 4 short diagnostic questions that guide",
-            "the user to find the cause themselves:",
+            "Return EXACTLY this shape with exactly 1 short diagnostic question that guides the developer to find the cause themselves:",
             "",
             "{",
             '  "conversation": {',
             '    "messages": [',
-            '      {"id": "q1", "role": "duck", "kind": "question", "content": "<first diagnostic question>", "intent": "<why you ask this>", "expects_user_reply": true},',
-            '      {"id": "q2", "role": "duck", "kind": "question", "content": "<second question>", "intent": "<intent>", "expects_user_reply": true},',
-            '      {"id": "q3", "role": "duck", "kind": "question", "content": "<third question>", "intent": "<intent>", "expects_user_reply": true},',
-            '      {"id": "q4", "role": "duck", "kind": "question", "content": "<fourth question>", "intent": "<intent>", "expects_user_reply": true}',
+            '      {"id": "q1", "role": "duck", "kind": "question", "content": "<diagnostic question>", "intent": "<why you ask this>", "expects_user_reply": true}',
             "    ],",
             '    "next_prompt_hint": "<a short hint for what the user could try next>"',
             "  }",
@@ -1887,22 +1885,6 @@ PREVIEW_STRUCTURED_OUTPUT = {
                 "kind": "question",
                 "content": "When you press an arrow key, do you see any input value change if you print the movement vector?",
                 "intent": "confirm_input_signal",
-                "expects_user_reply": True,
-            },
-            {
-                "id": "preview_q2",
-                "role": "duck",
-                "kind": "question",
-                "content": "Is the movement code running inside the physics update, or only once when the scene loads?",
-                "intent": "locate_update_loop",
-                "expects_user_reply": True,
-            },
-            {
-                "id": "preview_q3",
-                "role": "duck",
-                "kind": "question",
-                "content": "Does the player node have a collision body that might be blocked immediately at spawn?",
-                "intent": "check_collision_blocker",
                 "expects_user_reply": True,
             },
         ],
@@ -2032,8 +2014,12 @@ def _render_structured_response(raw_answer: str, raw_json: str, repo: str, branc
 def _pending_card(title: str) -> str:
     """A small placeholder shown in a tab while its section is still generating."""
     return (
-        f'<div class="info-card"><div class="card-kicker">{html.escape(title)}</div>'
-        'Generating… the duck is still working on this section.'
+        '<div class="info-card loading-card">'
+        '<span class="build-spinner" aria-hidden="true"></span>'
+        '<div class="loading-card-body">'
+        f'<div class="card-kicker">{html.escape(title)}</div>'
+        '<div class="loading-card-text">Generating response from your favourite duck...</div>'
+        '</div>'
         '</div>'
     )
 
@@ -2041,7 +2027,7 @@ def _pending_card(title: str) -> str:
 def _ask_first_card(title: str) -> str:
     return (
         f'<div class="info-card"><div class="card-kicker">{html.escape(title)}</div>'
-        'Ask a question to get some feedback.'
+        'Ask a question to get some feedback from your favourite duck.'
         '</div>'
     )
 
@@ -2053,7 +2039,7 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
     Rather than producing the whole schema in a single (slow) call that blocks
     every tab until the end, we ask the model for one small section per call.
     Each call is short — and stops the instant it emits a complete JSON object —
-    so Duck Questions can render while Repo Findings are still being generated,
+    so Quacking can render while Repo Findings are still being generated,
     and so on. This is a Gradio generator: each ``yield`` pushes a fresh set of
     tab contents to the UI.
     """
@@ -2084,7 +2070,7 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
         return json.dumps(structured, indent=2, ensure_ascii=False)
 
     sections = [
-        ("Duck Questions", _duck_questions_prompt, "duck_questions"),
+        ("Quacking", _duck_questions_prompt, "duck_questions"),
         ("Repo Findings", _repo_findings_prompt, "repo_findings"),
         ("Fix Options", _fix_options_prompt, "fix_options"),
         ("Refactor", _refactor_prompt, "refactor"),
@@ -2092,7 +2078,7 @@ def ask_repo(repo: str, branch: str, destination: str, problem: str,
 
     # Initial frame: everything pending so the user sees immediate feedback.
     pending = {
-        "duck_questions": _pending_card("Duck Questions"),
+        "duck_questions": _pending_card("Quacking"),
         "repo_findings": _pending_card("Repo Findings"),
         "fix_options": _pending_card("Fix Options"),
         "refactor": _pending_card("Refactor"),
@@ -2185,7 +2171,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                         <div class="duck-mark"></div>
                         <div>
                             <div class="brand-title">Rubber Duck Games</div>
-                            <div class="brand-subtitle">Clone a project, then debug beside the duck.</div>
+                            <div class="brand-subtitle">Clone a project, then debug with the duck!</div>
                         </div>
                     </div>
                     """
@@ -2251,8 +2237,8 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                     )
 
                     with gr.Tabs(selected="duck_questions"):
-                        with gr.Tab("Duck Questions", id="duck_questions"):
-                            duck_questions = gr.HTML(value=_ask_first_card("Duck Questions"))
+                        with gr.Tab("DuckChat", id="duck_questions"):
+                            duck_questions = gr.HTML(value=_ask_first_card("Duck Chat"))
 
                         with gr.Tab("Repo Findings"):
                             repo_findings = gr.HTML(value=_ask_first_card("Repo Findings"))
@@ -2294,6 +2280,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             temperature,
         ],
         outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
+        show_progress="hidden",
     )
     problem_input.submit(
         ask_repo,
@@ -2306,6 +2293,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
             temperature,
         ],
         outputs=[duck_questions, repo_findings, fix_options, refactor, raw_json],
+        show_progress="hidden",
     )
     for component in [repo_input, branch_input]:
         component.change(

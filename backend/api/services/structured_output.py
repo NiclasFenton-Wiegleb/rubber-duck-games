@@ -10,6 +10,7 @@ from typing import Any
 
 LEVELS = {"low", "medium", "high"}
 REFACTOR_TIMING = {"now", "after_fix", "later"}
+MAX_DUCK_QUESTIONS = 1
 
 
 def default_structured_answer(
@@ -240,6 +241,7 @@ def _normalize_session(structured: dict[str, Any], base: dict[str, Any]) -> None
 def _normalize_conversation(structured: dict[str, Any]) -> None:
     conversation = structured.get("conversation") if isinstance(structured.get("conversation"), dict) else {}
     messages = []
+    duck_question_count = 0
     raw_messages = conversation.get("messages") if isinstance(conversation.get("messages"), list) else []
     for index, raw in enumerate(raw_messages, start=1):
         if not isinstance(raw, dict):
@@ -247,11 +249,17 @@ def _normalize_conversation(structured: dict[str, Any]) -> None:
         content = _clean_text(raw.get("content"))
         if not content:
             continue
+        role = _clean_text(raw.get("role"), "duck")
+        kind = _clean_text(raw.get("kind"), "question")
+        if role == "duck" and kind == "question":
+            if duck_question_count >= MAX_DUCK_QUESTIONS:
+                continue
+            duck_question_count += 1
         messages.append(
             {
                 "id": _clean_text(raw.get("id"), f"duck_message_{index}"),
-                "role": _clean_text(raw.get("role"), "duck"),
-                "kind": _clean_text(raw.get("kind"), "question"),
+                "role": role,
+                "kind": kind,
                 "content": content,
                 "intent": _clean_text(raw.get("intent"), "clarify_symptom"),
                 "expects_user_reply": _clean_bool(raw.get("expects_user_reply"), True),
@@ -365,9 +373,6 @@ def render_duck_questions(structured: dict[str, Any]) -> str:
             '</div>'
             '</div>'
         )
-    hint = _clean_text(structured.get("conversation", {}).get("next_prompt_hint"))
-    if hint:
-        lines.append(f'<div class="info-card"><div class="card-kicker">Next</div>{html.escape(hint)}</div>')
     return f'<div class="chat-thread">{"".join(lines)}</div>'
 
 
