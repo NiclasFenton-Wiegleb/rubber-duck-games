@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib.util
 import html
 import json
+import faulthandler
 import logging
 import os
 import subprocess
@@ -32,6 +33,15 @@ import threading
 import time
 import warnings
 from pathlib import Path
+
+# Keep local native math/tokenizer libraries from spawning competing threadpools.
+# This makes native crashes easier to diagnose and avoids common macOS OpenMP issues.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+faulthandler.enable(all_threads=True)
 
 warnings.filterwarnings(
     "ignore",
@@ -1133,7 +1143,9 @@ GPU_LOAD_DURATION = int(os.getenv("ZEROGPU_LOAD_DURATION", "120"))
 
 
 def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
-                  temperature: float, stop_on_json: bool = False) -> int:
+                  temperature: float, stop_on_json: bool = False,
+                  prepared_context: str = "",
+                  prepared_sources_json: str = "[]") -> int:
     """Reserve more quota only for the (one-off) first call that loads weights."""
     try:
         from api.services.llm_service import get_llm_service
@@ -1146,7 +1158,9 @@ def _gpu_duration(message: str, use_context: bool, max_new_tokens: int,
 
 
 def _run_generation(message: str, use_context: bool, max_new_tokens: int,
-                    temperature: float, stop_on_json: bool = False) -> dict:
+                    temperature: float, stop_on_json: bool = False,
+                    prepared_context: str = "",
+                    prepared_sources_json: str = "[]") -> dict:
     """Core generation logic — called directly or wrapped by @spaces.GPU."""
     from api.services.llm_service import get_llm_service
 
@@ -1156,12 +1170,23 @@ def _run_generation(message: str, use_context: bool, max_new_tokens: int,
 
     t0 = time.time()
     llm = get_llm_service(flask_app.config)
+    prepared_sources: list[dict] = []
+    if prepared_context:
+        try:
+            decoded_sources = json.loads(prepared_sources_json or "[]")
+            if isinstance(decoded_sources, list):
+                prepared_sources = decoded_sources
+        except json.JSONDecodeError:
+            log.warning("Could not decode prepared retrieval sources; ignoring")
+
     result = llm.generate_simple(
         message,
         max_new_tokens=int(max_new_tokens),
         temperature=float(temperature),
         use_context=bool(use_context),
         stop_on_json=bool(stop_on_json),
+        context_override=prepared_context if prepared_context else None,
+        sources_override=prepared_sources,
     )
     elapsed = time.time() - t0
 
@@ -1206,6 +1231,27 @@ def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float
              "stop_on_json=%s", len(message), use_context, max_new_tokens,
              temperature, stop_on_json)
 
+    generation_use_context = bool(use_context)
+    prepared_context = ""
+    prepared_sources_json = "[]"
+
+    # Retrieval loads SentenceTransformer/FAISS native libraries. On ZeroGPU,
+    # doing that inside the forked @spaces.GPU worker has caused hard segfaults
+    # just before LLM generation starts, so prepare KG context in the host and
+    # pass the plain text/sources into the worker.
+    if _SPACES_AVAILABLE and generation_use_context:
+        try:
+            from api.services.llm_service import get_llm_service
+
+            llm = get_llm_service(flask_app.config)
+            sources: list[dict]
+            prepared_context, sources = llm.prepare_context(message, True)
+            prepared_sources_json = json.dumps(sources, ensure_ascii=False)
+            generation_use_context = False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not prepare retrieval context before GPU worker: %s", exc)
+            generation_use_context = False
+
     # Clear torch's host-side CUDA device-count cache right before the ZeroGPU
     # worker is forked, so the worker re-detects its freshly-assigned GPU instead
     # of inheriting the host's cached "0 devices" (the cause of the worker dying
@@ -1214,8 +1260,15 @@ def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float
         _reset_host_cuda_cache()
 
     try:
-        result = _generate_simple(message, use_context, max_new_tokens, temperature,
-                                  stop_on_json)
+        result = _generate_simple(
+            message,
+            generation_use_context,
+            max_new_tokens,
+            temperature,
+            stop_on_json,
+            prepared_context,
+            prepared_sources_json,
+        )
 
     except Exception as exc:  # noqa: BLE001
         log.exception("Generation failed: %s", exc)
@@ -1428,21 +1481,39 @@ def clone_build_progress_html(
     )
 
 
+def _ask_duck_button_update(project_ready: bool):
+    return gr.update(interactive=bool(project_ready))
+
+
+def _problem_input_update(project_ready: bool):
+    return gr.update(interactive=bool(project_ready))
+
+
 def clone_and_build_project(repo: str, branch: str, destination: str):
-    yield clone_build_progress_html(
-        "loading",
-        "Step 1 of 2: checking the destination and cloning the selected branch if needed.",
-        "clone",
-        title="Preparing repository",
+    yield (
+        clone_build_progress_html(
+            "loading",
+            "Step 1 of 2: checking the destination and cloning the selected branch if needed.",
+            "clone",
+            title="Preparing repository",
+        ),
+        _ask_duck_button_update(False),
+        _problem_input_update(False),
+        False,
     )
 
     clone_result = clone_project(repo, branch, destination)
     if not clone_result["ok"]:
-        yield clone_build_progress_html(
-            "error",
-            clone_result["message"],
-            "clone",
-            repo_path=clone_result.get("path", ""),
+        yield (
+            clone_build_progress_html(
+                "error",
+                clone_result["message"],
+                "clone",
+                repo_path=clone_result.get("path", ""),
+            ),
+            _ask_duck_button_update(False),
+            _problem_input_update(False),
+            False,
         )
         return
 
@@ -1456,13 +1527,18 @@ def clone_and_build_project(repo: str, branch: str, destination: str):
         if clone_result["reused"]
         else "Repository cloned successfully. "
     )
-    yield clone_build_progress_html(
-        "loading",
-        clone_detail + "Step 2 of 2: scanning files, chunking source, and creating graph links. This can take a few minutes.",
-        "kg",
-        title="Building knowledge graph",
-        repo_path=clone_result["path"],
-        kg_name=kg_name,
+    yield (
+        clone_build_progress_html(
+            "loading",
+            clone_detail + "Step 2 of 2: scanning files, chunking source, and creating graph links. This can take a few minutes.",
+            "kg",
+            title="Building knowledge graph",
+            repo_path=clone_result["path"],
+            kg_name=kg_name,
+        ),
+        _ask_duck_button_update(False),
+        _problem_input_update(False),
+        False,
     )
 
     try:
@@ -1483,42 +1559,62 @@ def clone_and_build_project(repo: str, branch: str, destination: str):
                 pass
             final_title = "Existing copy indexed" if clone_result["reused"] else "Repo cloned and indexed"
             final_detail = "The knowledge graph is ready. You can ask the duck about this project now."
-            yield clone_build_progress_html(
-                "success",
-                final_detail,
-                "kg",
-                title=final_title,
-                repo_path=clone_result["path"],
-                kg_name=kg_name,
-                stats=stats,
+            yield (
+                clone_build_progress_html(
+                    "success",
+                    final_detail,
+                    "kg",
+                    title=final_title,
+                    repo_path=clone_result["path"],
+                    kg_name=kg_name,
+                    stats=stats,
+                ),
+                _ask_duck_button_update(True),
+                _problem_input_update(True),
+                True,
             )
         else:
             err = resp.text[:500]
             log.warning("KG build returned HTTP %d: %s", resp.status_code, err)
-            yield clone_build_progress_html(
-                "error",
-                f"The backend returned HTTP {resp.status_code}: {err}",
-                "kg",
-                repo_path=clone_result["path"],
-                kg_name=kg_name,
+            yield (
+                clone_build_progress_html(
+                    "error",
+                    f"The backend returned HTTP {resp.status_code}: {err}",
+                    "kg",
+                    repo_path=clone_result["path"],
+                    kg_name=kg_name,
+                ),
+                _ask_duck_button_update(False),
+                _problem_input_update(False),
+                False,
             )
     except requests.exceptions.ConnectionError:
         log.warning("KG build: backend not reachable at %s", BACKEND_URL)
-        yield clone_build_progress_html(
-            "error",
-            "The backend is not reachable, so the knowledge graph could not be built.",
-            "kg",
-            repo_path=clone_result["path"],
-            kg_name=kg_name,
+        yield (
+            clone_build_progress_html(
+                "error",
+                "The backend is not reachable, so the knowledge graph could not be built.",
+                "kg",
+                repo_path=clone_result["path"],
+                kg_name=kg_name,
+            ),
+            _ask_duck_button_update(False),
+            _problem_input_update(False),
+            False,
         )
     except Exception as exc:  # noqa: BLE001
         log.exception("KG build failed: %s", exc)
-        yield clone_build_progress_html(
-            "error",
-            f"Knowledge graph build failed: {exc}",
-            "kg",
-            repo_path=clone_result["path"],
-            kg_name=kg_name,
+        yield (
+            clone_build_progress_html(
+                "error",
+                f"Knowledge graph build failed: {exc}",
+                "kg",
+                repo_path=clone_result["path"],
+                kg_name=kg_name,
+            ),
+            _ask_duck_button_update(False),
+            _problem_input_update(False),
+            False,
         )
 
 
@@ -2069,6 +2165,16 @@ def repo_summary_html(repo: str, branch: str, destination: str) -> str:
     """
 
 
+def repo_context_changed(repo: str, branch: str, destination: str):
+    return (
+        repo_summary_html(repo, branch, destination),
+        clone_build_progress_html(),
+        _ask_duck_button_update(False),
+        _problem_input_update(False),
+        False,
+    )
+
+
 with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
     with gr.Column(elem_classes=["app-shell"]):
         with gr.Row(elem_classes=["app-grid"]):
@@ -2109,11 +2215,12 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                 )
 
                 destination_input = gr.State("./runs/duck-repo-copy")
+                project_ready = gr.State(False)
                 clone_button = gr.Button("Clone Repo & Build KG", variant="primary", elem_classes=["primary-duck"])
                 clone_status = gr.HTML(value=clone_build_progress_html())
 
                 with gr.Accordion("Model options", open=False):
-                    use_context = gr.Checkbox(value=True, label="Use knowledge-graph context")
+                    use_context = gr.Checkbox(value=False, label="Use knowledge-graph context")
                     temperature = gr.Slider(0.0, 1.5, value=0.65, step=0.05, label="Temperature")
 
             with gr.Column(elem_classes=["session-panel"]):
@@ -2134,8 +2241,14 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
                         placeholder="e.g. I can't move the player with the arrow keys, I've tried...",
                         lines=3,
                         elem_classes=["compact-input"],
+                        interactive=False,
                     )
-                    problem_submit = gr.Button("Ask the duck", variant="primary", elem_classes=["primary-duck"])
+                    problem_submit = gr.Button(
+                        "Ask the duck",
+                        variant="primary",
+                        elem_classes=["primary-duck"],
+                        interactive=False,
+                    )
 
                     with gr.Tabs(selected="duck_questions"):
                         with gr.Tab("Duck Questions", id="duck_questions"):
@@ -2157,7 +2270,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
     clone_button.click(
         clone_and_build_project,
         inputs=[repo_input, branch_input, destination_input],
-        outputs=clone_status,
+        outputs=[clone_status, problem_submit, problem_input, project_ready],
     )
     fetch_branches_button.click(
         fetch_branches,
@@ -2195,9 +2308,9 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
     )
     for component in [repo_input, branch_input]:
         component.change(
-            repo_summary_html,
+            repo_context_changed,
             inputs=[repo_input, branch_input, destination_input],
-            outputs=repo_summary,
+            outputs=[repo_summary, clone_status, problem_submit, problem_input, project_ready],
         )
     demo.load(lambda: backend_status(), outputs=status)
     status_timer = gr.Timer(value=5)
