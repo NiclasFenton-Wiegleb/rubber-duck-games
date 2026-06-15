@@ -2271,6 +2271,7 @@ with gr.Blocks(title="Rubber Duck Games", css=APP_CSS) as demo:
         clone_and_build_project,
         inputs=[repo_input, branch_input, destination_input],
         outputs=[clone_status, problem_submit, problem_input, project_ready],
+        show_progress="hidden",
     )
     fetch_branches_button.click(
         fetch_branches,
