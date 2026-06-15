@@ -280,35 +280,65 @@ class LLMService:
 
 
     def _load_processor_or_tokenizer(self):
-        """Load a bare ``AutoTokenizer`` for **text-only** generation.
+        """Load a bare tokenizer for **text-only** generation.
 
-        This service only does text-to-text, so we deliberately avoid the
-        multimodal ``AutoProcessor``: Gemma 4's processor pulls in image /
-        audio processing classes that require optional heavy dependencies
-        (e.g. ``torchvision``), which would otherwise fail at import with
-        ``ModuleNotFoundError: No module named 'torchvision'``. The tokenizer
-        already carries the chat template we use via ``apply_chat_template``,
-        so it's all we need for text generation.
-
-        Requires ``transformers >= 5.5.0`` — older versions don't know
-        Gemma 4 and crash with ``'list' object has no attribute 'keys'``.
+        Some fine-tuned repos can ship bad tokenizer metadata while still
+        including a valid tokenizer.json. In particular, this project's default
+        model currently advertises ``tokenizer_class=TokenizersBackend``, which
+        Transformers cannot import. When AutoTokenizer hits that, fall back to
+        a direct fast-tokenizer load from the cached snapshot and provide a
+        small ChatML template.
         """
+        import json
+        from pathlib import Path
+
         import transformers
-        from transformers import AutoTokenizer
+        from huggingface_hub import try_to_load_from_cache
+        from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
         try:
             tokenizer = AutoTokenizer.from_pretrained(self.model_id)
             log.info("Loaded tokenizer via AutoTokenizer (text-only)")
             return tokenizer
         except AttributeError as exc:
-            # Typical symptom of a too-old transformers for this checkpoint.
             raise RuntimeError(
                 f"Failed to load a tokenizer for '{self.model_id}'. "
                 f"The installed transformers "
                 f"({getattr(transformers, '__version__', '?')}) is too old for "
-                f"this model — Gemma 4 requires transformers>=5.5.0. "
-                f"Please upgrade transformers (see requirements.txt)."
+                f"this model. Please upgrade transformers (see requirements.txt)."
             ) from exc
+        except ValueError as exc:
+            if "TokenizersBackend" not in str(exc):
+                raise
+            log.warning(
+                "AutoTokenizer failed because %s advertises invalid "
+                "tokenizer_class=TokenizersBackend; falling back to tokenizer.json",
+                self.model_id,
+            )
+            tokenizer_config_path = try_to_load_from_cache(self.model_id, "tokenizer_config.json")
+            tokenizer_json_path = try_to_load_from_cache(self.model_id, "tokenizer.json")
+            if not isinstance(tokenizer_config_path, str) or not isinstance(tokenizer_json_path, str):
+                raise RuntimeError(
+                    f"Tokenizer files for '{self.model_id}' are not cached locally. "
+                    "Connect to Hugging Face once or choose a model with valid AutoTokenizer metadata."
+                ) from exc
+
+            cfg = json.loads(Path(tokenizer_config_path).read_text())
+            tokenizer = PreTrainedTokenizerFast(
+                tokenizer_file=tokenizer_json_path,
+                bos_token=cfg.get("bos_token"),
+                eos_token=cfg.get("eos_token"),
+                pad_token=cfg.get("pad_token") or cfg.get("eos_token"),
+                model_max_length=cfg.get("model_max_length", 131072),
+            )
+            tokenizer.chat_template = cfg.get("chat_template") or (
+                "{% for message in messages %}"
+                "<|im_start|>{{ message['role'] }}\n{{ message['content'] }}<|im_end|>\n"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+            )
+            log.info("Loaded tokenizer from cached tokenizer.json fallback")
+            return tokenizer
 
 
 
@@ -330,8 +360,19 @@ class LLMService:
 
     # ── Public generation methods ─────────────────────────────────────────────
 
+    def prepare_context(self, query: str, use_context=True) -> tuple[str, list[dict]]:
+        """Retrieve KG context for a query without touching the LLM weights."""
+        if use_context and self._should_use_context(query):
+            return self._retrieve_context(query)
+        if use_context:
+            log.info("Skipping retrieval (heuristic gate): query looks "
+                     "conversational/self-contained")
+        return "", []
+
     def generate_simple(self, query: str, max_new_tokens=None, temperature=None,
-                         use_context=True, stop_on_json=False) -> dict:
+                         use_context=True, stop_on_json=False,
+                         context_override: str | None = None,
+                         sources_override: list[dict] | None = None) -> dict:
         """
         Direct, fast answer — no extended reasoning.
 
@@ -350,12 +391,11 @@ class LLMService:
 
         system = get_system_prompt(self.config)
 
-        context, sources = "", []
-        if use_context and self._should_use_context(query):
-            context, sources = self._retrieve_context(query)
-        elif use_context:
-            log.info("Skipping retrieval (heuristic gate): query looks "
-                     "conversational/self-contained")
+        if context_override is not None:
+            context = context_override
+            sources = sources_override or []
+        else:
+            context, sources = self.prepare_context(query, use_context)
 
         user = query
         if context:
