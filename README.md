@@ -27,7 +27,7 @@ tags:
 
 A friendly AI-powered rubber duck debugger built for hobby game developers. Give it a game repo and a bug report; it clones the project, builds a knowledge graph over the copied source, and asks one focused debugging question grounded in the actual code.
 
-Built by Liam Curran and Niclas FW for the Build Small Hackathon.
+Built by Liam Curran and Niclas Fenton-Wiegleb for the Build Small Hackathon.
 
 ## How the Space runs
 
