@@ -40,23 +40,28 @@ torch>=2.8,<2.12
 # ("'list' object has no attribute 'keys'").
 transformers>=5.5.0
 accelerate>=0.30
-# ── bitsandbytes is DELIBERATELY NOT installed on the ZeroGPU Space ──────────
-# ROOT CAUSE of the recurring "RuntimeError: No CUDA GPUs are available" inside
-# spaces' `worker_init → torch.init() → torch.Tensor([0]).cuda()`:
+# ── bitsandbytes: required for 4-bit on dedicated-GPU Spaces (T4/A10G/L4) ────
+# This Space can run on a **dedicated GPU** (e.g. t4-small) where the host owns
+# a real, persistent CUDA context and ``LLM_LOAD_IN_4BIT`` genuinely loads the
+# model with bitsandbytes NF4 quantization. Without this package, model loading
+# fails with:
+#   "Using `bitsandbytes` 4-bit quantization requires bitsandbytes:
+#    pip install -U bitsandbytes>=0.46.1"
 #
-#   bitsandbytes initialises a real CUDA driver context *on import* using its
-#   own native ctypes calls (cuInit/cudaGetDeviceCount), bypassing the `spaces`
-#   torch-CUDA emulation entirely — so none of the host tripwires catch it.
-#   transformers/accelerate import bitsandbytes while loading the model in the
-#   host process (their `is_bitsandbytes_available()` checks import the package).
-#   Once a CUDA context exists in the host, the forked ZeroGPU worker inherits a
-#   broken CUDA state and `torch.init()` dies with "No CUDA GPUs are available".
-#
-# On ZeroGPU we never use 4-bit anyway (llm_service skips bitsandbytes and loads
-# in bfloat16 — see the "skipping bitsandbytes" log line), so installing it here
-# is pure downside. Keep it ONLY in backend/requirements.txt for real,
-# persistent-CUDA deployments where LLM_LOAD_IN_4BIT is genuinely used.
-# DO NOT add bitsandbytes to this (HuggingFace Space) requirements file.
+# Why this is SAFE even though bitsandbytes initialises a real CUDA context on
+# import (which historically broke ZeroGPU's *forked* @spaces.GPU worker):
+#   * On **ZeroGPU** (SPACES_ZERO_GPU set), app.py poisons the bitsandbytes
+#     import slot (``sys.modules["bitsandbytes"] = None``) BEFORE transformers
+#     can probe it, and llm_service skips 4-bit entirely and loads in bfloat16.
+#     So the dangerous import never runs on a ZeroGPU host.
+#   * On a **dedicated GPU** (SPACES_ZERO_GPU unset), there is no forked worker —
+#     the host legitimately owns CUDA — so initialising bitsandbytes is exactly
+#     what we want.
+# The ZeroGPU guards in app.py are now gated on the SPACES_ZERO_GPU env var (not
+# merely on `spaces` being importable), so this package is harmless on ZeroGPU
+# and necessary on a dedicated GPU.
+bitsandbytes>=0.46.1
+
 
 
 # ── Gradio frontend + local API client ─────────────────────────

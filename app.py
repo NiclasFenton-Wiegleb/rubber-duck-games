@@ -66,10 +66,34 @@ try:
     import spaces  # noqa: E402
 
     _SPACES_AVAILABLE = True
-    log.info("spaces module imported — running on HuggingFace ZeroGPU")
+    log.info("spaces module imported")
 except ImportError:
     _SPACES_AVAILABLE = False
     log.info("spaces module not found — running in local mode (no ZeroGPU)")
+
+
+# ── Distinguish real ZeroGPU from a dedicated-GPU Space ──────────────────────
+# The `spaces` package is installed on *every* GPU Space (ZeroGPU **and**
+# dedicated T4/A10G/L4 instances), so "is `spaces` importable?" is NOT a
+# reliable test for ZeroGPU. The only authoritative signal is the
+# ``SPACES_ZERO_GPU`` environment variable, which HuggingFace sets exclusively
+# on the ZeroGPU runtime.
+#
+# This distinction matters: the ZeroGPU-specific guards below (poisoning
+# bitsandbytes, the CUDA-init tripwire, the CPU-host eager-load, the pre-fork
+# cache reset) exist solely to protect ZeroGPU's *forked* worker model. On a
+# dedicated GPU the host owns a persistent, real CUDA context and those guards
+# are actively harmful — e.g. poisoning bitsandbytes breaks legitimate 4-bit
+# quantization. Gate every ZeroGPU-only workaround on ``_IS_ZERO_GPU``.
+_IS_ZERO_GPU = os.environ.get("SPACES_ZERO_GPU", "").lower() in ("1", "true", "yes")
+if _SPACES_AVAILABLE:
+    if _IS_ZERO_GPU:
+        log.info("ZeroGPU runtime detected (SPACES_ZERO_GPU set).")
+    else:
+        log.info("Dedicated-GPU / non-ZeroGPU Space detected (SPACES_ZERO_GPU "
+                 "not set) — host owns a real CUDA context; ZeroGPU fork "
+                 "workarounds disabled.")
+
 
 
 # ── Block bitsandbytes on ZeroGPU (prevents the forked-worker CUDA crash) ─────
@@ -88,9 +112,17 @@ except ImportError:
 # available". This is a belt-and-suspenders guard on top of bitsandbytes being
 # absent from the Space's requirements.txt — it neutralises stale build caches
 # or transitive re-installs. No-op off ZeroGPU.
-if _SPACES_AVAILABLE:
+#
+# IMPORTANT: this MUST be gated on ``_IS_ZERO_GPU`` (the SPACES_ZERO_GPU env
+# var), NOT on ``_SPACES_AVAILABLE``. The `spaces` package is installed on
+# dedicated-GPU Spaces too, where the host owns a real, persistent CUDA context
+# and 4-bit quantization via bitsandbytes is both safe and desirable. Poisoning
+# the import there breaks ``LLM_LOAD_IN_4BIT`` with
+# "Using bitsandbytes 4-bit quantization requires bitsandbytes".
+if _IS_ZERO_GPU:
     sys.modules.setdefault("bitsandbytes", None)
     log.info("bitsandbytes import blocked on ZeroGPU host (forked-worker CUDA safety).")
+
 
 
 # ── Host-side CUDA-init tripwire (ZeroGPU diagnostics) ───────────────────────
@@ -180,8 +212,9 @@ def _reset_host_cuda_cache() -> None:
                 pass
 
 
-if _SPACES_AVAILABLE:
+if _IS_ZERO_GPU:
     _install_cuda_init_tripwire()
+
 
 
 
@@ -217,7 +250,7 @@ def _configure_environment() -> str:
     # ── GPU detection at startup ──────────────────────────────────────────
 
     if "LLM_DEVICE" not in os.environ:
-        if _SPACES_AVAILABLE:
+        if _IS_ZERO_GPU:
             log.info("ZeroGPU runtime detected — setting LLM_DEVICE=cuda; the "
                      "model is eager-loaded onto CPU in the host process (the "
                      "host never touches CUDA) and moved onto the real GPU "
@@ -225,6 +258,10 @@ def _configure_environment() -> str:
             os.environ["LLM_DEVICE"] = "cuda"
 
         else:
+            # Dedicated-GPU Spaces (T4/A10G/L4) and local runs land here: the
+            # host owns a real, persistent CUDA context, so it is safe to probe
+            # torch.cuda directly and place the model on the real device.
+
             try:
                 import torch  # noqa: F811 (already imported above via spaces?)
             except ImportError:
@@ -1266,7 +1303,8 @@ def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float
     # pass the plain text/sources into the worker. DuckChat also passes a
     # focused repo/problem retrieval query so the search is based on the copied
     # project, not on the JSON schema instructions in the generation prompt.
-    if generation_use_context and (_SPACES_AVAILABLE or explicit_retrieval_query):
+    if generation_use_context and (_IS_ZERO_GPU or explicit_retrieval_query):
+
         try:
             from api.services.llm_service import get_llm_service
 
@@ -1287,8 +1325,9 @@ def ask(message: str, use_context: bool, max_new_tokens: int, temperature: float
     # worker is forked, so the worker re-detects its freshly-assigned GPU instead
     # of inheriting the host's cached "0 devices" (the cause of the worker dying
     # in worker_init with "No CUDA GPUs are available"). No-op off ZeroGPU.
-    if _SPACES_AVAILABLE:
+    if _IS_ZERO_GPU:
         _reset_host_cuda_cache()
+
 
     try:
         result = _generate_simple(
