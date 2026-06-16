@@ -226,8 +226,16 @@ backend/artifacts/
 runs/
 test-repo/
 
+# ── Accidentally-committed local/secret files (do NOT commit) ────────────────
+# Credentials / signatures for the HF storage bucket — secrets, keep out of git.
+hf_bucket_api.txt
+hf_sig.txt
+# Junk filename produced by a malformed shell paste (conda activation line).
+ersNiclasWieglebminiconda3shellcondabinconda-hook.ps1*
+
 # Binary model / index / pickle files
 *.pkl
+
 *.pickle
 *.faiss
 *.index
